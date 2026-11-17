@@ -73,7 +73,7 @@ rtp_ports		16384-17384
 rtp_bandwidth		1024-2048
 audio_jitter_buffer_type	adaptive		# off, fixed, adaptive
 audio_jitter_buffer_delay	1-100		# (min. frames)-(max. packets)
-video_jitter_buffer_type	adaptive		# off, fixed, adaptive
+video_jitter_buffer_type	fixed		# off, fixed, adaptive
 video_jitter_buffer_delay	1-100		# (min. frames)-(max. packets)
 rtp_stats		yes
 rtp_timeout		60
@@ -102,7 +102,7 @@ module		cons.so
 #module		httpd.so
 
 # Audio codec Modules (in order)
-module			opus.so
+#module			opus.so
 #module			amr.so
 #module			g7221.so
 module			g722.so

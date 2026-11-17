@@ -100,6 +100,11 @@ class Menu {
 
         const dtmfOptions = this.getDtmfOptions();
         dtmfOptions.forEach((option) => {
+            if (option.enable) {
+                if (option.enable.value !== option.enable.ref) {
+                    return; // Skip this option if the condition is not met
+                }
+            }
             column.appendChild(this.createFlexLine(option));
         });
 
@@ -248,8 +253,111 @@ class Menu {
             );
         } catch (err) {
             console.error("Error during Menu setup:", err);
+            onError(err);
         }
     }
 }
+
+window.updateQrCode = function() {
+    pairingInfo = window.pairingInfo;
+    if (pairingInfo && pairingInfo.pairingCode != "") {
+        qrB64 = pairingInfo.qrCodeB64;
+        pairingCode = pairingInfo.pairingCode;
+        pairingUrl = pairingInfo.pairingUrl;
+    }
+
+    // fallback: update existing elements or create them with explicit styles
+    let container = document.getElementById('qr-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'qr-container';
+        Object.assign(container.style, {
+            position: 'fixed',
+            right: '50px',
+            bottom: '70px',
+            zIndex: '10001',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center'
+        });
+    }
+
+    let qrDiv = document.getElementById('qr-overlay');
+    if (!qrDiv) {
+        qrDiv = document.createElement('div');
+        qrDiv.id = 'qr-overlay';
+        Object.assign(qrDiv.style, {
+            background: 'rgba(255,255,255,0.92)',
+            padding: '8px',
+            borderRadius: '8px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            marginBottom: '10px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+        });
+        container.appendChild(qrDiv);
+    }
+
+    let img = qrDiv.querySelector('img');
+    if (!img) {
+        img = document.createElement('img');
+        qrDiv.appendChild(img);
+    }
+    img.src = 'data:image/png;base64,' + qrB64;
+    Object.assign(img.style, {
+        width: '100px',
+        height: '100px',
+        display: 'block'
+    });
+
+    let info = document.getElementById('pairing-info');
+    if (!info && (pairingCode || pairingUrl)) {
+        info = document.createElement('div');
+        info.id = 'pairing-info';
+        Object.assign(info.style, {
+            background: '#ffffff',
+            padding: '8px',
+            borderRadius: '8px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            color: '#2a3550',
+            fontSize: '1.125rem',
+            lineHeight: '1.4',
+            textAlign: 'center'
+        });
+        container.appendChild(info);
+    }
+
+    // Built with DOM nodes
+    if (info) {
+        info.replaceChildren();
+        if (pairingCode) {
+            info.append('Code: ' + pairingCode);
+        }
+        if (pairingUrl) {
+            if (pairingCode) {
+                info.append(document.createElement('br'));
+            }
+            const link = document.createElement('a');
+            link.href = pairingUrl;
+            link.target = '_blank';
+            link.textContent = pairingUrl;
+            info.append('(', link, ')');
+        }
+    }
+
+    // Ensure visible and on top
+    container.style.display = 'flex';
+    container.style.zIndex = '10001';
+    if (!document.body.contains(container)) {
+        if (window.menu) {
+            const menuDtmf = document.getElementById('menu_dtmf');
+            menuDtmf.appendChild(container);
+        }
+        else{
+            document.body.appendChild(container);
+        }
+    }
+};
 
 window.Menu = Menu;

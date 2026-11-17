@@ -1,0 +1,183 @@
+#!/usr/bin/env python
+import sys
+import atexit
+import time
+import os
+import re
+import json
+import subprocess
+import signal
+import threading
+
+sys.path.append(f"{os.path.dirname(os.path.abspath(__file__))}/../../src")
+from ivr import IVR
+
+def parseEnvFile(envPath):
+    envVars = {}
+    multilineKey = None
+    multilineVal = []
+
+    with open(envPath) as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            # Multiline value (for JSON)
+            if multilineKey:
+                if line.endswith("'"):
+                    multilineVal.append(line[:-1])
+                    val = "\n".join(multilineVal)
+                    envVars[multilineKey] = val
+                    multilineKey = None
+                    multilineVal = []
+                else:
+                    multilineVal.append(line)
+                continue
+
+            # Remove inline comments
+            line = re.sub(r'\s+#.*$', '', line)
+            if '=' not in line:
+                continue
+
+            key, val = line.split('=', 1)
+            key = key.strip()
+            val = val.strip()
+
+            # Handle multiline JSON (starts and ends with single quote)
+            if val.startswith("'") and not val.endswith("'"):
+                multilineKey = key
+                multilineVal = [val[1:]]
+                continue
+
+            val = val.strip('"').strip("'")
+
+            # If ${VAR:-default}
+            match = re.match(r'\$\{([A-Za-z0-9_]+):-([^\}]*)\}', val)
+            if match:
+                default = match.group(2)
+                # If default contains a $ (anywhere), set to ''
+                if '$' in default:
+                    val = ''
+                else:
+                    val = default
+            # If ${VAR}, set to ''
+            elif re.match(r'\$\{[A-Za-z0-9_]+\}', val):
+                val = ''
+
+            envVars[key] = val
+
+    return envVars
+
+def exitHandler():
+    subprocess.run(
+        ['echo "/quit" | netcat -q 1 127.0.0.1 5555'],
+        shell=True
+    )
+
+def browse(ivr):
+    # ivr.chromeOptions.arguments.remove('--start-fullscreen')
+    # ivr.chromeOptions.arguments.remove('--kiosk')
+    #ivr.chromeOptions.add_argument('--app=file:///dev/null')
+    ivr.run()
+    print('Exit IVR')
+
+atexit.register(exitHandler)
+signal.signal(signal.SIGTERM, exitHandler)
+signal.signal(signal.SIGINT, exitHandler)
+
+# Set environment variables
+envPath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../.env')
+envVars = parseEnvFile(envPath)
+for key, value in envVars.items():
+    if key != 'DISPLAY':
+        os.environ[key] = value
+
+def envsubst(string):
+    return re.sub(
+        r'\$\{([A-Za-z0-9_]+)\}',
+        lambda match: os.environ.get(match.group(1), ""),
+        string
+    )
+
+templatePath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../browsing/assets/config.template.json')
+configPath = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../browsing/assets/config.json')
+
+with open(templatePath) as file:
+    content = file.read()
+
+with open(configPath, "w") as file:
+    config = json.loads(envsubst(content))
+    file.write(json.dumps(config, indent=4))
+
+def loadJS(driver, jsScript):
+    with open(jsScript, "r", encoding="utf-8") as f:
+        js_code = f.read()
+    driver.execute_script(js_code)
+
+# Launch IVR
+os.environ['ID'] = "0"
+# os.environ['AUDIO_ONLY'] = "true"
+mixedRoomDomainId = ''
+#os.environ['GW_NAME'] = "yo"
+os.environ['HOST_IP'] = "192.168.1.21"
+os.environ['GW_PROXY'] = "http://192.168.1.21:9000"
+demoMode = False
+
+cmd = [
+    "chromedriver",
+    "--port=9515",
+    "--host=0.0.0.0",
+    "--allowed-ips=127.0.0.1,192.168.92.1"
+]
+subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True
+)
+ivr = IVR(width='1280', height='720', browsingName='visio', roomName='chz-xkgp-zif', mixedId=mixedRoomDomainId, name='Meeting Room')
+ivr.chromeOptions.arguments.remove('--start-fullscreen')
+ivr.chromeOptions.arguments.remove('--kiosk')
+ivr.launchBrowser("about:blank")
+#ivr.driver.get("about:blank")
+browseThread = threading.Thread(target=browse, args=(ivr,))
+browseThread.start()
+
+if demoMode:
+    while not ivr.driver:
+        time.sleep(0.1)
+    loadJS(ivr.driver, os.path.join(os.path.dirname(os.path.normpath(__file__)), '../../browsing/assets/IVR/screen.js'))
+    time.sleep(1)
+    driver = ivr.driver
+    loadJS(ivr.driver, os.path.join(os.path.dirname(os.path.normpath(__file__)), '../../browsing/assets/IVR/demo.js'))
+    ivr.driver.execute_script("""window.onclick = async function(){
+                                await dialer.pressSequence(["1", "#"], 1000);
+                                await new Promise(r => setTimeout(r, 1000));
+                                await dialer.pressSequence(["1","2","3","4","5","#"], 1000);};""")
+    #while ivr.driver == driver:
+    while not ivr.browsingObj:
+        time.sleep(0.1)
+    while not ivr.browsingObj.driver :
+        time.sleep(0.1)
+
+    driver = ivr.browsingObj.driver
+    while not driver.execute_script("return document.querySelector('#menu_icon');"):
+        time.sleep(1)
+
+    loadJS(driver, os.path.join(os.path.dirname(os.path.normpath(__file__)), '../../browsing/assets/IVR/screen.js'))
+    loadJS(driver, os.path.join(os.path.dirname(os.path.normpath(__file__)), '../../browsing/assets/IVR/demo.js'))
+    driver.execute_script("""window.onclick = async function(){
+                                await dialer.pressSequence(["1","1"], 1500);
+                                await dialer.pressSequence(["2","2"], 1500);
+                                await dialer.pressSequence(["3","3"], 1500);
+                                await dialer.pressSequence(["4","4"], 1500);
+                                await dialer.pressSequence(["5","5"], 5000);
+                                await new Promise(r => setTimeout(r, 1000));
+                                await dialer.pressKey("3");
+                            };""")
+
+while True:
+    time.sleep(1)
+
+sys.exit(0)

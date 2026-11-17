@@ -29,6 +29,16 @@ export class Room {
             });
     }
 
+    generateRandomString(length = 5) {
+        const characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        let result = '';
+        for (let i = 0; i < length; i++) {
+            const randomIndex = Math.floor(Math.random() * characters.length);
+            result += characters.charAt(randomIndex);
+        }
+        return result;
+    }
+
     async initRoom(roomId, onSuccess = () => {}, onError = () => {}) {
         this.roomId = roomId;
         this.roomName = roomId;

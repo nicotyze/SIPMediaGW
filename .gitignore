@@ -1,5 +1,9 @@
 .vagrant/
 __pycache__
+.pytest_cache
 logs/
-.DS_Store
+.coverage
+.ruff_cache/
+.vscode/
 browsing/assets/config.json
+.worktrees/

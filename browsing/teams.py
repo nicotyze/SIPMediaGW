@@ -22,6 +22,7 @@ class Teams(Browsing):
         super().__init__(*args, **kwargs)
         if os.environ.get('WITH_ALSA') == "true":
             self.chromeOptions.add_argument('--alsa-input-device=hw:1,1')
+            self.chromeOptions.add_argument('--alsa-output-device=hw:0,0')
 
     def loadPage(self):
         self.driver.get("https://{}/{}".format(
@@ -31,9 +32,6 @@ class Teams(Browsing):
         WebDriverWait(self.driver, 60).until(
             EC.presence_of_element_located((By.TAG_NAME, "video"))
         )
-
-    def chatHandler(self):
-        pass
 
     def unset(self):
         try:

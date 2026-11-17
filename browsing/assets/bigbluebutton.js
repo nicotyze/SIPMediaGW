@@ -150,16 +150,20 @@ class Bigbluebutton extends UIHelper {
             document.querySelector('[accesskey="R"]').click();
         if (key == "5")
             document.querySelector('[accesskey="U"]').click();
-        if (key == "6")
-            document.querySelector("[aria-label='Accept recording and continue']").click();
+        if (key == "6") {
+            const acceptRecording = document.querySelector("[data-test='recordingNotifyContinue'], [aria-label='Accept recording and continue']");
+            if (acceptRecording) {
+                acceptRecording.click();
+            }
+        }
         if (key == "s" || key == "q")
             document.querySelector("[data-test='startScreenShare']").click();
     }
 
-    async typeText(text) {
+    async sendChat(message) {
         const input = document.querySelector('#message-input');
         const lastValue = input.value;
-        input.value = text;
+        input.value = message;
         const tracker = input._valueTracker;
         if (tracker) {
             tracker.setValue(lastValue);

@@ -6,19 +6,23 @@ networks:
 services:
   gw:
     image: "${DOCKER_IMAGE}"
-    restart: ${RESTART}
+    build:
+      context: .
+      args:
+        GW_VERSION: ${GW_VERSION:-dev}
+        ALLOW_DEV_BUILD: ${ALLOW_DEV_BUILD:-1}
     container_name: gw${ID}
     networks:
       default:
         aliases:
           - "${ROOM}"
+    ports:
+      - 127.0.0.1:951${ID}:9515
+    init: true
     tmpfs:
       - /tmp
     volumes:
       - ./logs:/var/logs
-      - ./browsing/:/var/browsing/
-      - ./baresip/config_default:/var/baresip/config_default
-      - ./src:/var/src
     devices:
       - /dev/${VIDEO_DEV}:/dev/video0
       - /dev/snd:/dev/snd

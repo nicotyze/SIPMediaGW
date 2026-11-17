@@ -10,9 +10,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse, urlsplit
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -20,37 +20,9 @@ import requests
 ### Config ###
 
 postUrl = os.environ.get("LOG_PUSH_URL", "").strip()
-
-
-def isTemplateValue(value: str) -> bool:
-    return ("$" in value) or ("{" in value) or ("}" in value)
-
-
-def getMachineTimezone():
-    tzCandidates = [
-        (os.environ.get("LOG_TIMEZONE") or "").strip(),
-        (os.environ.get("TZ") or "").strip(),
-        (os.environ.get("HOST_TZ") or "").strip(),
-    ]
-
-    try:
-        with open("/etc/timezone", "r", encoding="utf-8") as tzFile:
-            tzCandidates.append(tzFile.read().strip())
-    except Exception:
-        pass
-
-    for tzName in tzCandidates:
-        if not tzName or isTemplateValue(tzName):
-            continue
-        try:
-            return ZoneInfo(tzName)
-        except Exception:
-            continue
-
-    return datetime.now().astimezone().tzinfo or timezone.utc
-
-
-machineTimezone = getMachineTimezone()
+# Optional shared secret expected by the receiver.
+# If unset: the push carries no Authorization header.
+postToken = os.environ.get("LOG_PUSH_TOKEN", "").strip()
 
 ### Regex ###
 
@@ -78,14 +50,47 @@ fieldMap = {
 
 ### Time functions ###
 
-def localNow() -> datetime:
-    return datetime.now(machineTimezone)
+def utcNow() -> datetime:
+    return datetime.now(timezone.utc)
 
-def isoLocal(dt: datetime, *, ms: bool = False) -> str:
-    return dt.astimezone(machineTimezone).isoformat(timespec="milliseconds" if ms else "seconds")
+def isoZ(dt: datetime, *, ms: bool = False) -> str:
+    s = dt.astimezone(timezone.utc).isoformat(timespec="milliseconds" if ms else "seconds")
+    return s.replace("+00:00", "Z")
 
 def rawTimestamp(dt: datetime) -> str:
-    return dt.astimezone(machineTimezone).strftime("%b %d %H:%M:%S")
+    return dt.astimezone(timezone.utc).strftime("%b %d %H:%M:%S")
+
+# "Set audio encoder: opus 48000Hz 2ch"
+# "Set video encoder: H264 packetization-mode=0 (2000000 bit/s, 30.00 fps)"
+encoderRegex = re.compile(
+    r"Set (?P<media>audio|video) encoder:\s*(?P<rest>.+)$")
+
+
+def gatewayVersions() -> Dict[str, str]:
+    """
+    What this gateway is, for the call history.
+
+    Three values are fixed at build time and read from the environment; the
+    fourth is read from the image, because the Chromium build falls back to
+    whatever the Debian pool still carries and only the file it writes knows
+    what was installed.
+
+    A missing value yields "unknown" rather than raising: a payload has to leave
+    even when an environment field is absent.
+    """
+    chromium = "unknown"
+    try:
+        chromium = Path("/etc/chromium.version").read_text().strip() or "unknown"
+    except OSError:
+        # Images built before the Chromium fallback have no such file.
+        pass
+    return {
+        "gwVersion": os.environ.get("GW_VERSION", "unknown"),
+        "baresipVersion": os.environ.get("BARESIP_VERSION", "unknown"),
+        "baresipPatch": os.environ.get("BARESIP_BRANCH", "unknown"),
+        "chromiumVersion": chromium,
+    }
+
 
 def parseIso(timestamp: str) -> Optional[datetime]:
     if not timestamp:
@@ -94,9 +99,7 @@ def parseIso(timestamp: str) -> Optional[datetime]:
         if timestamp.endswith("Z"):
             return datetime.fromisoformat(timestamp[:-1]).replace(tzinfo=timezone.utc)
         dt = datetime.fromisoformat(timestamp)
-        if dt.tzinfo:
-            return dt
-        return dt.replace(tzinfo=machineTimezone)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
@@ -279,7 +282,13 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
     peerDisplay = ""
     closeReason = ""
     lastEventType = ""
-
+    # What the endpoint announced itself as. Empty until baresip carries the
+    # User-Agent header through to the event.
+    peerUserAgent = ""
+    # Which way each stream was agreed to run, from CALL_ESTABLISHED.
+    mediaDir: Dict[str, str] = {}
+    # What the gateway settled on: one audio line, one video line per stream.
+    encoders: Dict[str, Any] = {}
 
     sourceUri = ""
     destinationUri = ""
@@ -288,9 +297,11 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
     destinationRoomName = ""
 
     roomLineValue = ""
+    browsingLineValue = ""
     sourceName = ""
     dtmfEvents: List[Dict[str, str]] = []
     media = MediaStats()
+    mediaSamples: List[Dict[str, Any]] = []
 
     haveFinalCallClosed = False
 
@@ -312,12 +323,14 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
             continue
 
         if recordType == "call_start":
-            if recordData.get("raw"):
-                callStartRaw = recordData.get("raw") or ""
-            if recordData.get("timestamp"):
-                callStartTimestamp = recordData.get("timestamp") or ""
+            callStartRaw = callStartRaw or (recordData.get("raw") or "")
+            callStartTimestamp = callStartTimestamp or (recordData.get("timestamp") or "")
             if recordData.get("url"):
                 callUrl = recordData.get("url") or ""
+            if recordData.get("peerUserAgent"):
+                peerUserAgent = recordData["peerUserAgent"]
+            if recordData.get("mediaDir"):
+                mediaDir = recordData["mediaDir"]
 
         elif recordType == "call_end":
             if recordData.get("raw"):
@@ -325,8 +338,20 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
             if recordData.get("timestamp"):
                 callEndTimestamp = recordData.get("timestamp") or ""
 
+        elif recordType == "encoder":
+            # Not "media": that name holds the MediaStats object a few lines
+            # above, and rebinding it here took the whole payload down with it.
+            encoderMedia = (recordData.get("media") or "").strip()
+            encoderValue = (recordData.get("value") or "").strip()
+            if encoderMedia == "audio":
+                encoders["audio"] = encoderValue
+            elif encoderMedia == "video":
+                encoders.setdefault("video", []).append(encoderValue)
+
         elif recordType == "room":
             roomLineValue = (recordData.get("value") or "").strip()
+        elif recordType == "browsing":
+            browsingLineValue = (recordData.get("value") or "").strip()
 
         elif recordType == "destination":
             if recordData.get("destinationURI"):
@@ -342,6 +367,11 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
                 continue
             if isFinal:
                 haveFinalCallClosed = True
+                # Tables printed before the call closed belong to readings,
+                # including one cut short by the hang-up; the video block of
+                # the call itself comes after.
+                if mediaSamples:
+                    media.videoStreams.clear()
 
             callId = recordData.get("callId") or callId
             peerDisplay = (recordData.get("peerDisplayName") or peerDisplay).strip()
@@ -358,6 +388,14 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
             inp = (recordData.get("input") or "").strip()
             if ts and inp:
                 dtmfEvents.append({"timestamp": ts, "input": inp})
+
+        elif recordType == "media_sample":
+            # The reading's own tables came just before it in the log.
+            media.videoStreams.clear()
+            mediaSamples.append({
+                "seconds": recordData.get("seconds"),
+                "video": recordData.get("video") or {},
+            })
 
         elif recordType == "stats_value":
             mediaType = (recordData.get("media") or "").strip().lower()
@@ -421,15 +459,27 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
         totalMs = sec * 1000
         totalRaw = f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
 
+    videoStreams = [media.videoStreams[i] for i in sorted(media.videoStreams)]
+    if mediaSamples:
+        # The log parser numbers the video tables with a counter that each
+        # reading advanced; the streams kept are the call's own, main then
+        # content, numbered 0 and 1 as on a call without readings.
+        videoStreams = [dict(stream, streamIndex=position)
+                        for position, stream in enumerate(videoStreams)]
+
     mediaStats = {
         "audio": {"tx": media.audioTx, "rx": media.audioRx},
-        "video": [media.videoStreams[i] for i in sorted(media.videoStreams)] if media.videoStreams else [],
+        "video": videoStreams,
+        # The same figures over time, one reading every MEDIA_STATS_INTERVAL
+        # seconds: totals say how the call went, these say when it went wrong.
+        "samples": mediaSamples,
     }
 
     callObj = {
         "mainApp": mainApp,
         "callUrl": callUrl,
-        "room":roomLineValue,
+        "browsing": browsingLineValue,
+        "room": roomLineValue,
         "roomType": roomType,
         "callSession": {
             "callStart": {"raw": callStartRaw, "timestamp": callStartTimestamp},
@@ -456,9 +506,14 @@ def buildPayloadFromLines(lines: List[str], postUrl: str) -> Dict[str, Any]:
             },
             "closeReason": closeReason,
             "lastEventType": lastEventType,
+            "peerUserAgent": peerUserAgent,
+            "encoders": encoders,
+            "mediaDir": mediaDir,
         },
         "dtmfEvents": dtmfEvents,
         "mediaStats": mediaStats,
+        # What served the call, as opposed to what the call was.
+        "gateway": gatewayVersions(),
     }
 
     jsonBody = {"call": callObj}
@@ -477,10 +532,13 @@ def pushHistory(historyPath: str) -> None:
             return
 
         payload = buildPayloadFromLines(lines, postUrl)
+        headers = {"Accept": "text/plain"}
+        if postToken:
+            headers["Authorization"] = f"Bearer {postToken}"
         resp = requests.post(
             postUrl,
             json=payload,
-            headers={"Accept": "text/plain"},
+            headers=headers,
             timeout=10,
         )
 
@@ -510,7 +568,7 @@ def main() -> None:
     videoAutoIndex = -1
     lastFinalCallId: Optional[str] = None
 
-    callStartLogged = False
+    gwStartLogged = False
 
     for raw in sys.stdin:
         cleaned = ansiEscapeRegex.sub("", raw)
@@ -527,42 +585,109 @@ def main() -> None:
                 continue
 
             try:
-                ### Call start ###
-                if (not callStartLogged) and ("Web browsing URL:" in line):
-                    dt = localNow()
+                ### Gateway start ###
+                if (not gwStartLogged) and ("Web browsing URL:" in line):
+                    dt = utcNow()
                     url = ""
                     if "URL:" in line:
                         url = line.split("URL:", 1)[1].strip()
 
                     appendHistory(
                         historyFile,
-                        "call_start",
-                        {"raw": rawTimestamp(dt), "timestamp": isoLocal(dt), "url": url},
+                        "gw_start",
+                        {"raw": rawTimestamp(dt), "timestamp": isoZ(dt), "url": url},
                     )
-                    callStartLogged = True
+                    gwStartLogged = True
+                    continue
+
+                ### Encoders ###
+                # What the gateway settled on, printed once per stream as it
+                # starts. The video line comes twice where a presentation
+                # stream exists, the second being the slides.
+                encMatch = encoderRegex.search(line.strip())
+                if encMatch:
+                    appendHistory(
+                        historyFile,
+                        "encoder",
+                        {
+                            "media": encMatch.group("media").lower(),
+                            "value": encMatch.group("rest").strip(),
+                        },
+                    )
                     continue
 
                 ### Room ###
                 if "room:" in line:
-                    room = ""
                     appendHistory(historyFile, "room", {"value": line.split("room:", 1)[1].strip()})
+                    continue
+
+                ### Browsing ###
+                if "browsing:" in line:
+                    appendHistory(historyFile, "browsing", {"value": line.split("browsing:", 1)[1].strip()})
                     continue
 
                 ### Event ###
                 if pref == "Event":
                     dtmfMatch = dtmfRegex.match(line.strip())
                     if dtmfMatch:
-                        dt = localNow()
+                        dt = utcNow()
                         appendHistory(
                             historyFile,
                             "dtmf",
-                            {"timestamp": isoLocal(dt, ms=True), "input": dtmfMatch.group("input").strip()},
+                            {"timestamp": isoZ(dt, ms=True), "input": dtmfMatch.group("input").strip()},
                         )
                         continue
 
                     eventDict = parseEventDict(line)
+
+                    # The gateway's own reading of how the media is doing,
+                    # printed every few seconds while the call is up. The
+                    # call-end block says what the whole call averaged, which
+                    # is what an incident does not look like: a stream that
+                    # stops decoding halfway through leaves an impeccable
+                    # average behind it.
+                    if eventDict and eventDict.get("type") == "MEDIA_STATS":
+                        appendHistory(historyFile, "media_sample", eventDict)
+                        continue
+
                     if eventDict and eventDict.get("class") == "call":
                         lastType = str(eventDict.get("type") or "").strip()
+
+                        ### Call established: trace the connected endpoint ###
+                        if lastType == "CALL_ESTABLISHED":
+                            appendHistory(
+                                historyFile,
+                                "call_start",
+                                {
+                                    "timestamp": isoZ(utcNow()),
+                                    "callId": str(eventDict.get("id") or "").strip(),
+                                    "sourceURI": normalizeSipUri(
+                                        str(eventDict.get("peeruri") or "").strip()
+                                    ),
+                                    "peerDisplayName": str(
+                                        eventDict.get("peerdisplayname") or ""
+                                    ).strip(),
+                                    # What the endpoint announced itself as.
+                                    # Absent until the gateway's baresip
+                                    # carries the header through.
+                                    "peerUserAgent": str(
+                                        eventDict.get("peeruseragent") or ""
+                                    ).strip(),
+                                    # Which way each stream was agreed to run.
+                                    # A sendonly on one side is what an empty
+                                    # picture looks like in the signalling.
+                                    "mediaDir": {
+                                        "audio": str(eventDict.get("audiodir") or "").strip(),
+                                        "video": str(eventDict.get("videodir") or "").strip(),
+                                        "remoteAudio": str(eventDict.get("remoteaudiodir") or "").strip(),
+                                        "remoteVideo": str(eventDict.get("remotevideodir") or "").strip(),
+                                        "localAudio": str(eventDict.get("localaudiodir") or "").strip(),
+                                        "localVideo": str(eventDict.get("localvideodir") or "").strip(),
+                                    },
+                                },
+                            )
+                            continue
+
                         if lastType != "CALL_CLOSED":
                             continue
 
@@ -590,8 +715,8 @@ def main() -> None:
                             },
                         )
 
-                        dt = localNow()
-                        appendHistory(historyFile, "call_end", {"raw": rawTimestamp(dt), "timestamp": isoLocal(dt)})
+                        dt = utcNow()
+                        appendHistory(historyFile, "call_end", {"raw": rawTimestamp(dt), "timestamp": isoZ(dt)})
 
                         pushHistory(historyFile)
                         continue
@@ -656,8 +781,8 @@ def main() -> None:
                         or "Files sent and removed" in line
                         or "Files moved in log directory" in line
                     ):
-                        dt = localNow()
-                        appendHistory(historyFile, "call_end", {"raw": rawTimestamp(dt), "timestamp": isoLocal(dt)})
+                        dt = utcNow()
+                        appendHistory(historyFile, "call_end", {"raw": rawTimestamp(dt), "timestamp": isoZ(dt)})
                         pushHistory(historyFile)
                         continue
 
@@ -667,4 +792,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -12,6 +12,7 @@ import signal
 import argparse
 import json
 import threading
+from baresipCmd import BaresipCmd
 from ivr import IVR
 from netstring import Netstring
 
@@ -54,6 +55,29 @@ if inputs['from']:
 dispWidth = int(inputs['res'].split('x')[0])
 dispHeight = int(inputs['res'].split('x')[1])
 
+# Launch chrome driver
+cmd = [
+    "chromedriver",
+    "--port=9515",
+    "--host=0.0.0.0",
+    "--allowed-ips="
+]
+subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True
+)
+
+for _ in range(100): # 10 s max
+    try:
+        with socket.create_connection(("127.0.0.1", 9515), timeout=0.2):
+            break
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise RuntimeError("Chromedriver did not start")
+
 # instanciate IVR
 ivr = IVR(
     width=dispWidth,
@@ -62,6 +86,8 @@ ivr = IVR(
     name=os.environ.get('USER_NAME'),
     browsingName=os.environ.get('BROWSING')
 )
+# Launch the browser (warm up)
+ivr.launchBrowser("about:blank")
 
 def browse(args):
     args['ivr'].run()
@@ -70,7 +96,40 @@ def browse(args):
 def endBrowse(args):
     if args['ivr'] and args['ivr'].browsingObj:
         args['ivr'].browsingObj.stop()
+    elif args['ivr'] and args['ivr'].driver:
+        # The IVR browser is still up (no meeting joined): quit it through
+        # selenium, which is deterministic. The xdotool fallback below only
+        # reaches whatever window has X focus.
+        try:
+            args['ivr'].driver.quit()
+        except Exception as e:
+            print("endBrowse: driver.quit() failed: {}".format(e), flush=True)
     subprocess.run(["xdotool", "key", "ctrl+W"])
+
+# How often the control port is asked how the media is doing, in seconds.
+# Zero turns the sampling off — recording and streaming gateways have no
+# control port to ask.
+mediaStatsInterval = int(os.getenv("MEDIA_STATS_INTERVAL", "10"))
+
+
+def mediaStatsLoop(startedAt):
+    """Ask the control port how the media is doing, at a steady interval.
+
+    The call-end statistics say what the whole call averaged, which is what an
+    incident does not look like: a stream that stops decoding halfway through
+    leaves an impeccable average behind it. These say when.
+    """
+    baresip = BaresipCmd()
+    while True:
+        time.sleep(mediaStatsInterval)
+        elapsed = round(time.time() - startedAt, 1)
+        video = baresip.videoStats(elapsed)
+        if not video:
+            continue          # the call is over, or baresip has gone
+
+        print({"type": "MEDIA_STATS", "seconds": elapsed, "video": video},
+              flush=True)
+
 
 # Event handler callback
 def event_handler(data, args):
@@ -96,12 +155,23 @@ def event_handler(data, args):
                 displayName = data['peerdisplayname'].split('-',1)[1][roomLen:]
             except:
                 displayName = data['peerdisplayname']
+        # The SIP proxy cuts the From header before '<', which keeps the space
+        # that separates the display name from the URI ("Room <sip:…>" gives
+        # "Room ").
+        displayName = displayName.strip()
         if not displayName:
             displayName = data['peeruri'].split(';')[0].split(':')[1]
         print("My name: "+displayName, flush=True)
         args['ivr'].name = displayName
         browseThread = threading.Thread(target=browse, daemon=True, args=(args,))
         browseThread.start()
+
+        # Only where there is a control port to ask: recording and streaming
+        # gateways run no baresip.
+        if mediaStatsInterval > 0 and os.getenv("MAIN_APP", "baresip") == "baresip":
+            statsThread = threading.Thread(target=mediaStatsLoop, daemon=True,
+                                           args=(time.time(),))
+            statsThread.start()
 
     if data['type'] == 'CALL_DTMF_START':
         print('Received DTMF:'+ data['param'], flush=True)
@@ -145,9 +215,15 @@ if os.environ.get('MAIN_APP') != 'baresip':
     browseThread = threading.Thread(target=browse, args=(argDict,))
     browseThread.start()
 
+# Register with the SIP server only now: before this point an incoming
+# call would ring with nobody to accept it (baresip.sh starts with regint=0)
+def registerSip():
+    subprocess.run(['echo "/uareg 60 0" | netcat -q 1 127.0.0.1 5555'], shell=True)
+
 # Start event handler loop
 ns = Netstring(baresipHost, 4444)
-ns.getEvents(event_handler, argDict)
+ns.getEvents(event_handler, argDict,
+             onConnect=registerSip if os.environ.get('MAIN_APP') == 'baresip' else None)
 
 # Terminate
 endBrowse(argDict)

@@ -1,5 +1,5 @@
 class Visio extends UIHelper{
-    constructor(domain, roomName, displayName, lang, prompts, token, audioOnly) {
+    constructor(domain, roomName, displayName, lang, prompts, token, audioOnly, dualScreenOn) {
         super();
         this.domain = domain;
         this.roomName = roomName;
@@ -8,8 +8,8 @@ class Visio extends UIHelper{
         this.token = token;
         this.joined = false;
         this.passwordPrompt = JSON.parse(prompts)[lang]['password'];
-        this.isZeroPrefix = false;
-        this.zeroPrefixTimer = null;
+        this.slideSelector = "video.lk-participant-media-video[data-lk-source='screen_share']";
+        this.dualScreenOn = dualScreenOn.toLowerCase() == 'true';
     }
 
     async join() {
@@ -44,124 +44,339 @@ class Visio extends UIHelper{
         }
     }
 
-    sendCtrlShortcut(letter, useShift = false) {
-        const k = String(letter).toLowerCase();
-        const event = new KeyboardEvent('keydown', {
-            key: useShift ? k.toUpperCase() : k,
-            code: 'Key' + k.toUpperCase(),
-            ctrlKey: true,
-            shiftKey: useShift,
-            bubbles: true,
-            cancelable: true,
-            view: window
-        });
-        document.dispatchEvent(event);
+    async slideShot() {
+        try {
+            const selector = "video.lk-participant-media-video[data-lk-source='screen_share']";
+            // short wait for the element to appear if necessary
+            const wait = ms => new Promise(res => setTimeout(res, ms));
+            let video = document.querySelector(selector);
+            const maxWait = 2000;
+            const step = 100;
+            let waited = 0;
+            while (!video && waited < maxWait) {
+                await wait(step);
+                waited += step;
+                video = document.querySelector(selector);
+            }
+            if (!video) {
+                return null;
+            }
+            // await the video to have valid dimensions
+            if (!video.videoWidth || !video.videoHeight) {
+                await new Promise(resolve => {
+                    const onLoaded = () => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    };
+                    // fallback timeout if the event doesn't arrive
+                    const t = setTimeout(() => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    }, 1000);
+                    video.addEventListener('loadeddata', onLoaded);
+                });
+            }
+            const width = video.videoWidth || video.clientWidth || 640;
+            const height = video.videoHeight || video.clientHeight || Math.round(width * 9 / 16);
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+
+            ctx.drawImage(video, 0, 0, width, height);
+
+            const dataURL = canvas.toDataURL('image/png');
+            if (!dataURL) {
+                return null;
+            }
+            // return the base64 part (without "data:image/png;base64,")
+            return dataURL.split(',')[1];
+        } catch (e) {
+            console.error("slideShot failed:", e);
+            return null;
+        }
+    }
+    _PIN_ICONS = {
+        unpin: {
+            // icon "pin crossed out" : present when the video IS pinned (click = unpin)
+            path: 'M20.9701 17.1716 19.5559 18.5858 16.0214 15.0513',
+            announce: ['no longer pinned', "n'est plus épinglé"],
+        },
+        pin: {
+            // "simple pin" : present when the video is NOT pinned (click = pin)
+            path: 'M18 3V5H17V11L19',
+            announce: ['is pinned', 'est épinglé'],
+        },
+    };
+
+    _visibleButtonsWithIcon(path) {
+    return [...document.querySelectorAll('button')]
+        .filter(b => b.offsetParent !== null)
+        .filter(b => b.querySelector(`svg.remixicon path[d^="${path}"]`));
     }
 
-    clickIfExists(selector) {
-        const element = document.querySelector(selector);
-        if (element)
-            element.click();
+    _togglePin(action) {
+        const video = document.querySelector(this.slideSelector);
+        if (!video) return Promise.resolve({ ok: false, pinned: null });
+
+        const oppositeAction = action === 'pin' ? 'unpin' : 'pin';
+        const { path, announce } = this._PIN_ICONS[action];
+        const oppositePath = this._PIN_ICONS[oppositeAction].path;
+
+        const matches = this._visibleButtonsWithIcon(path);
+        const button = matches[0];
+
+        if (!button) {
+            const alreadyThere = this._visibleButtonsWithIcon(oppositePath).length > 0;
+            return Promise.resolve(
+                alreadyThere
+                    ? { ok: true, pinned: action === 'pin' }
+                    : { ok: false, pinned: null }
+            );
+        }
+
+        button.click();
+        return this._waitForAnnounce(announce, 2000).then(confirmed => ({
+            ok: confirmed,
+            pinned: this._visibleButtonsWithIcon(this._PIN_ICONS.unpin.path).length > 0,
+        }));
     }
 
-    sendReaction(selector) {
-        this.sendCtrlShortcut('e', true);
-        this.waitForElement(selector, { visible: true, clickable: true }, 2000)
-            .then((button) => {
-                button.click();
-                // Close reaction panel shortly after sending the reaction.
-                this.clickIfExists('button[data-attr*="reactions-toggle"]');
-            })
-            .catch(() => {
-                this.clickIfExists('button[data-attr*="reactions-toggle"]');
+    pinSlide() {
+        let succeeded = this._togglePin('pin');
+        if (succeeded){
+            document.getElementById("slide-streamer-force-style")?.remove();
+        }
+        return succeeded;
+    }
+    unpinSlide() { return this._togglePin('unpin'); }
+
+    _waitForAnnounce(needles, timeout = 2000) {
+        return new Promise(resolve => {
+            const region = document.querySelector('[data-announce-channel="global"]');
+            if (!region) return resolve(false);
+
+            const matches = () => {
+                const t = region.textContent.toLowerCase();
+                return needles.some(n => t.includes(n.toLowerCase()));
+            };
+
+            if (matches()) return resolve(true);
+
+            const obs = new MutationObserver(() => {
+                if (matches()) { obs.disconnect(); clearTimeout(timer); resolve(true); }
             });
+            obs.observe(region, { childList: true, subtree: true, characterData: true });
+            const timer = setTimeout(() => { obs.disconnect(); resolve(false); }, timeout);
+        });
     }
 
-    interact(key) {
-        const k = String(key).toLowerCase();
-        if (k === "0") {
-            this.isZeroPrefix = true;
-            clearTimeout(this.zeroPrefixTimer);
-            this.zeroPrefixTimer = setTimeout(() => {
-                this.isZeroPrefix = false;
-            }, 2000);
+    mediaState() {
+        const el = document.getElementById('media-state');
+        if (!el) {
+            console.error('[✗] media-state element not found');
+            return null;
+        }
+        // Publish permissions are optional: they are only exposed by Visio
+        // instances that carry the can-publish attributes. Undefined is
+        // reported as null so that a client can tell "not allowed to publish"
+        // from "this instance does not say", instead of assuming the former.
+        const canPublish = (value) =>
+            value === undefined ? null : value === 'true';
+        return {
+            microphone: el.dataset.microphoneEnabled === 'true',
+            camera: el.dataset.cameraEnabled === 'true',
+            canPublishMicrophone: canPublish(el.dataset.canPublishMicrophone),
+            canPublishCamera: canPublish(el.dataset.canPublishCamera)
+        };
+    }
+    microphone(param) {
+        const state = this.mediaState();
+        if (!state) {
             return;
         }
 
-        if (this.isZeroPrefix) {
-            this.isZeroPrefix = false;
-            clearTimeout(this.zeroPrefixTimer);
-            switch (k) {
-                case "1":
-                    this.sendReaction('button[data-attr="send-reaction-thumbs-up"]');
-                    return;
-                case "2":
-                    this.sendReaction('button[data-attr="send-reaction-red-heart"]');
-                    return;
-                case "3":
-                    this.sendReaction('button[data-attr="send-reaction-clapping-hands"]');
-                    return;
-                case "4":
-                    this.sendReaction('button[data-attr="send-reaction-face-with-tears-of-joy"]');
-                    return;
-                default:
-                    // Unknown prefixed command: continue with normal handling.
-                    break;
+        const shouldToggle = (param === 'on' && !state.microphone) ||
+                             (param === 'off' && state.microphone);
+
+        if (shouldToggle) {
+            const microphoneButton = document.querySelector('[aria-label*="Ctrl+d"]');
+            if (!microphoneButton) {
+                console.error('[✗] Microphone button not found');
+                return;
             }
-        }
-
-        switch (k) {
-            case "1":
-                this.sendCtrlShortcut('d');
-                this.clickIfExists('[aria-label*="Ctrl+d"]');
-                break;
-            case "2":
-                this.sendCtrlShortcut('e');
-                this.clickIfExists('[aria-label*="Ctrl+e"]');
-                break;
-            case "3":
-            case "c":
-                this.sendCtrlShortcut('m', true);
-                this.clickIfExists('button[data-attr*="controls-chat-closed"], button[data-attr*="controls-chat-open"]');
-                break;
-            case "4":
-                this.sendCtrlShortcut('h', true);
-                this.clickIfExists('button[data-attr*="controls-hand-raise"], button[data-attr*="controls-hand-lower"]');
-                break;
-            case "5":
-                this.sendCtrlShortcut('p', true);
-                this.clickIfExists('button[data-attr*="controls-participants-closed"], button[data-attr*="controls-participants-open"]');
-                break;
-            case "6":
-                this.sendCtrlShortcut('f', true);
-                break;
-            case "7":
-                this.sendCtrlShortcut('l', true);
-                break;
-            case "s":
-	    case "q":
-                document.querySelector('[data-attr*="controls-screenshare"]').click();
-
-        	const interval = setInterval(() => {
-            		const tile = document.querySelector('[data-lk-source="screen_share"]');
-            		if (!tile) return;
-
-            		const ignoreBtn = [...tile.querySelectorAll('button')]
-                          	.find(btn => /ignore/i.test(btn.textContent));
-
-            		if (ignoreBtn) {
-                		clearInterval(interval);
-                		ignoreBtn.click();
-            		}	
-        	}, 200);
-
-        	setTimeout(() => clearInterval(interval), 5000);                
-		break;
-            default:
-                break;
+            microphoneButton.click();
         }
     }
+    camera(param) {
+        const state = this.mediaState();
+        if (!state) {
+            return;
+        }
 
+        const shouldToggle = (param === 'on' && !state.camera) ||
+                             (param === 'off' && state.camera);
+
+        if (shouldToggle) {
+            const cameraButton = document.querySelector('[aria-label*="Ctrl+e"]');
+            if (!cameraButton) {
+                console.error('[\u2717] Camera button not found');
+                return;
+            }
+            cameraButton.click();
+        }
+    }
+    async reaction(name) {
+        const known = ['thumbs-up', 'thumbs-down', 'clapping-hands', 'red-heart',
+                       'face-with-tears-of-joy', 'face-with-open-mouth',
+                       'party-popper', 'folded-hands'];
+        if (!known.includes(name)) {
+            console.error('[✗] Unknown reaction: ' + name);
+            return false;
+        }
+        const toggle = document.querySelector('[data-attr="reactions-toggle"]');
+        if (!toggle) {
+            console.error('[✗] Reactions toggle not found');
+            return false;
+        }
+        if (toggle.getAttribute('aria-expanded') !== 'true') {
+            toggle.click();
+        }
+        try {
+            const button = await this.waitForElement(
+                '[data-attr="send-reaction-' + name + '"]', { clickable: true }, 2000);
+            button.click();
+        } catch (e) {
+            console.error('[✗] Reaction button not reachable: ' + name);
+            return false;
+        } finally {
+            if (toggle.getAttribute('aria-expanded') === 'true') {
+                toggle.click();
+            }
+        }
+        return true;
+    }
+    uiState() {
+        return {
+            media: this.mediaState(),
+            panels: this.panelState(),
+            screenShare: this.screenShareState(),
+            dualScreen: this.dualScreenOn
+        };
+    }
+    screenShareState() {
+        // A screen being shared, by anyone — the room's own content included:
+        // what slideShot captures, found the same way.
+        return document.querySelector("video[data-lk-source='screen_share']") !== null;
+    }
+    panelState() {
+        // Visio's side panels (chat, participants, info) carry a data-attr
+        // suffixed -closed or -open, and are mutually exclusive: opening one
+        // closes the one that was open. The raise-hand button follows another
+        // convention, its label naming the available action, so -hand-lower
+        // means the hand is currently raised.
+        //
+        // The meeting tools panel (toggle-tools) is left out: its data-attr is
+        // the same whether it is open or closed, so its state cannot be
+        // observed this way.
+        const open = (name) =>
+            document.querySelector('[data-attr="controls-' + name + '-open"]') !== null;
+        return {
+            chat: open('chat'),
+            participants: open('participants'),
+            info: open('info'),
+            handRaised:
+                document.querySelector('[data-attr="controls-hand-lower"]') !== null
+        };
+    }
+    interact(key) {
+        const reactionKeys = {
+            "7": "thumbs-up",
+            "8": "red-heart",
+            "9": "clapping-hands",
+            "a": "face-with-tears-of-joy"
+        };
+        if (key in reactionKeys)
+            this.reaction(reactionKeys[key]);
+        if (key == "1")
+            document.querySelector('[aria-label*="Ctrl+d"]').click();
+        if (key == "2")
+            document.querySelector('[aria-label*="Ctrl+e"]').click();
+        if (key == "3" || key == "c")
+            document.querySelector('button[data-attr*="controls-chat-closed"], button[data-attr*="controls-chat-open"]').click();
+        if (key == "4")
+            document.querySelector('button[data-attr*="controls-hand-raise"], button[data-attr*="controls-hand-lower"]').click();
+        if (key == "5")
+            document.querySelector('button[data-attr*="controls-participants-closed"], button[data-attr*="controls-participants-open"]').click();
+        if (key == "6")
+            this.dualScreenOn = !this.dualScreenOn;
+        if (key == "0")
+            document.querySelector('button[data-attr*="controls-info-closed"], button[data-attr*="controls-info-open"]').click();
+        if (key == "s" || key == "q") {
+            document.querySelector('[data-attr*="controls-screenshare"]').click();
+
+            const interval = setInterval(() => {
+                const tile = document.querySelector('[data-lk-source="screen_share"]');
+                if (!tile) return;
+
+                const ignoreBtn = [...tile.querySelectorAll('button')]
+                    .find(btn => /ignore/i.test(btn.textContent));
+
+                if (ignoreBtn) {
+                    clearInterval(interval);
+                    ignoreBtn.click();
+                }
+            }, 200);
+
+            setTimeout(() => clearInterval(interval), 5000);
+        }
+    }
+    async sendChat(message) {
+        if (!message || !String(message).trim()) {
+            console.error('[\u2717] Empty chat message');
+            return false;
+        }
+        // The chat textarea is only mounted while the chat panel is open.
+        const closed = document.querySelector('[data-attr="controls-chat-closed"]');
+        if (closed) {
+            closed.click();
+        }
+        let textarea;
+        try {
+            textarea = await this.waitForElement('textarea', { visible: true }, 5000);
+        } catch (e) {
+            console.error('[\u2717] Chat textarea not reachable');
+            return false;
+        }
+        // Native setter, so that React registers the new value
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype,
+            'value'
+        ).set;
+        nativeSetter.call(textarea, message);
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        // The send button stays disabled until React has re-rendered.
+        const sendButton = textarea.parentElement.querySelector('button');
+        if (!sendButton) {
+            console.error('[\u2717] Chat send button not found');
+            return false;
+        }
+        const start = Date.now();
+        while (sendButton.disabled) {
+            if (Date.now() - start > 5000) {
+                console.error('[\u2717] Chat send button stayed disabled');
+                return false;
+            }
+            await new Promise(r => setTimeout(r, 50));
+        }
+        sendButton.click();
+        return true;
+    }
+    hasLeft() {
+        // Visio redirects to /feedback once the participant is out of the
+        // conference, including when it evicts an idle one.
+        return window.location.pathname.startsWith('/feedback');
+    }
     async leave() {
         console.log('[INFO] Leave the meeting room');
         try {

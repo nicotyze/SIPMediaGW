@@ -1,36 +1,220 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import re
+import base64
 import redis
 import os
+from pathlib import Path
 import httpx
 import datetime as dt
+import random, string
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import RedirectResponse
+from urllib.parse import quote_plus
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Runs the gateway monitor for as long as the proxy is up."""
+    monitor = asyncio.create_task(monitorGateways(intervalSeconds=30))
+    yield
+    monitor.cancel()
+    try:
+        await monitor
+    except asyncio.CancelledError:
+        pass
 
+app = FastAPI(lifespan=lifespan,
+              docs_url="/api_docs",
+              redoc_url="/api_redoc")
 
+redisClient = redis.Redis(host=os.getenv('REDIS_HOST', '127.0.0.1'),
+                          port=int(os.getenv('REDIS_PORT', '6379')),
+                          decode_responses=True)
 
-redisClient = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
-allowedToken = "1234"
-adminToken = "admin-secret-key"  # Change this to a secure admin key
+allowedToken = os.getenv("PROXY_TOKEN", "1234")
+# No default: an unset PROXY_ADMIN_TOKEN disables admin routes (same
+# convention as PROXY_ROOM_TOKEN) instead of exposing a well-known secret.
+adminToken = os.getenv("PROXY_ADMIN_TOKEN", "")
+# Dedicated token for room-side clients, which only need to resolve their own
+# gateway id. Empty by default, which keeps /gateway_id closed: the route is
+# only enabled on deployments where endpoints can be trusted to hold a secret.
+roomToken = os.getenv("PROXY_ROOM_TOKEN", "")
 
 # Redis Mapping:
-# gateway:<gw_id> => "<gw_ip>|<state>|type|room_name|start_time|<media_duration>|<transcript_progress>"
-# state: started | working | stopped
+# gateway:<gw_id> => {"gw_ip": …, "gw_state": …, "gw_type": …, "room": …,
+#                     "physical_room": …,
+#                     "start_time": …, "media_duration": …,
+#                     "transcript_progress": …, "browsing": …,
+#                     "peer_uri": …, "peer_name": …, "call_started": …}
+# state: created | started | stopped | deleted, and stopping
+#   created  VM provisioned, container initialised once then stopped, unused
+#   started  container running, a call is in progress
+#   stopped  container stopped after a call — the VM is still reusable
+#   deleted  VM torn down
+# The two pairs answer different questions: created/deleted describe the VM,
+# started/stopped the container running on it.
+#
+# stopping is written by the media scaler, not by this proxy: it marks a VM it
+# has asked the provider to destroy, and it is the scaler alone that reads it
+# back — to find the ones whose destruction never completed. deriveState
+# surfaces it as "other", which is what an unknown value gets and is right
+# here: the gateway is neither free nor in a call.
+#
+# Not to be confused with the "stopping" this proxy looks for in a gateway's
+# processing_state when stopping one: same word, different field, and that one
+# says the container is on its way down rather than the VM.
 
-redis_gw_field_count = 7
+assetDir = os.path.dirname(os.path.abspath(__file__))
 
-redis_gw_ip_index = 0
-redis_gw_state_index = 1
-redis_gw_type_index = 2
-redis_gw_room_index = 3
-redis_gw_start_time_index = 4
-redis_gw_media_duration_index = 5
-redis_gw_transcript_progress_index = 6
+# A gateway's entry, by name. Adding a field here is the whole of adding a
+# field: nothing reads by position any more, and an entry written before a
+# field existed simply does not carry it.
+gwFields = ("gw_ip", "gw_state", "gw_type", "room", "physical_room", "start_time",
+            "media_duration", "transcript_progress", "browsing",
+            "peer_uri", "peer_name", "call_started")
+
+
+def gwLoad(raw):
+    """Read an entry. Anything unreadable comes back as an empty one, which
+    every caller already had to handle."""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def gwDump(gw: dict):
+    """Write an entry, fields in their declared order so a human reading the
+    key with redis-cli sees them the same way twice."""
+    ordered = {k: gw[k] for k in gwFields if k in gw}
+    ordered.update({k: v for k, v in gw.items() if k not in ordered})
+    return json.dumps(ordered)
+
+
+def cleanPart(value):
+    """Normalise a field: empty and the string 'None' — which the old
+    pipe-separated form had no way to tell from a real absence — read as
+    None."""
+    return value if value and value != "" and value != "None" else None
+
+
+@app.get("/favicon/{filename}.svg")
+async def logo(filename: str):
+    filePath = Path(assetDir) / f"{filename}.svg"
+
+    if not filePath.is_file():
+        raise HTTPException(status_code=404, detail="Logo not found")
+
+    return FileResponse(filePath, media_type="image/svg+xml")
+
+@app.get("/pairing")
+async def pairing_page(request: Request):
+    """
+    Serve the pairing HTML page so /pairing?error=...&pairingCode=...
+    works and pairing.html.handleQueryParams() can show the message / prefill.
+    """
+    try:
+        with open(os.path.join(assetDir, "pairing.html"), "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type="text/html")
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"detail": "pairing.html not found"})
+
+@app.get("/")
+@app.get("/portal")
+async def portal_page(request: Request):
+    """The vitrine, the default page: the service, beside a phone showing the
+    live pairing page.
+
+    The phone loads /pairing, so a code entered there drives the real flow —
+    a live one walks the phone onto /interact, still in the frame. A room
+    screen prints /pairing in full; the redirects after a refused code point
+    at it, and so may links made before this.
+    """
+    try:
+        with open(os.path.join(assetDir, "portal.html"), "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type="text/html")
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"detail": "portal.html not found"})
+
+# What each page is allowed to ask for. A whitelist rather than a directory:
+# the name arrives in a URL, and these are the only files a page ever wants.
+#
+# Neither list is behind a check, as neither page is: the pairing code is what
+# grants access and it is entered on one of them, while reaching a gateway
+# takes a gw_id the other carries in its query string.
+pairingStaticFiles = {"brand.js": "application/javascript",
+                      "shared.css": "text/css",
+                      "pairing.css": "text/css",
+                      "pairing.js": "application/javascript"}
+
+interactStaticFiles = {"brand.js": "application/javascript",
+                       "shared.css": "text/css",
+                       "interact-connexion.css": "text/css",
+                       "interact-controls.css": "text/css",
+                       "interact.js": "application/javascript"}
+
+DOCS = {"fr": "docs/docs.fr.html", "en": "docs/docs.en.html"}
+
+def serveAsset(file_name: str, allowed: dict):
+    """One file from a page's whitelist, or a 404.
+
+    no-cache: the pages are edited in place and re-read on every request, so a
+    browser holding a cached script would silently run the old one beside the
+    new markup. The header forces a revalidation on every load."""
+    mediaType = allowed.get(file_name)
+    if not mediaType:
+        return JSONResponse(status_code=404, content={"detail": "not found"})
+    try:
+        with open(os.path.join(assetDir, file_name), "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type=mediaType,
+                            headers={"Cache-Control": "no-cache"})
+    except FileNotFoundError:
+        return JSONResponse(status_code=404, content={"detail": f"{file_name} not found"})
+
+
+@app.get("/pairing/static/{file_name}")
+async def pairing_static(file_name: str):
+    return serveAsset(file_name, pairingStaticFiles)
+
+
+@app.get("/interact/static/{file_name}")
+async def interact_static(file_name: str):
+    return serveAsset(file_name, interactStaticFiles)
+
+
+# The portal's own files, a whitelist as above: its css and js sit in the
+# project root like the other pages', its diagram assets in assets/. This
+# handler reads whole files rather than going through serveAsset, whose text
+# mode cannot carry the diagram's pngs.
+portalStaticFiles = {"portal.css": "text/css",
+                     "portal.js": "application/javascript",
+                     "icons.svg": "image/svg+xml",
+                     "renater.png": "image/png",
+                     "rendez-vous-renater.png": "image/png",
+                     "webinaire-etat-dinum.png": "image/png",
+                     "visio-dinum.png": "image/png",
+                     "classe-virtuelle-esr.png": "image/png"}
+
+@app.get("/portal/static/{file_name}")
+async def portal_static(file_name: str):
+    mediaType = portalStaticFiles.get(file_name)
+    if not mediaType:
+        return JSONResponse(status_code=404, content={"detail": "not found"})
+    path = os.path.join(assetDir, file_name)
+    if not os.path.isfile(path):
+        path = os.path.join(assetDir, "assets", file_name)
+    if not os.path.isfile(path):
+        return JSONResponse(status_code=404, content={"detail": f"{file_name} not found"})
+    # no-cache, as serveAsset: same reason, same dev loop.
+    return FileResponse(path, media_type=mediaType,
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.exception_handler(RequestValidationError)
@@ -43,7 +227,6 @@ def validation_exception_handler(request: Request, exc: RequestValidationError):
             "message": exc.errors(),
         },
     )
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -68,64 +251,219 @@ def authorize(request: Request):
 
 def authorizeAdmin(request: Request):
     """Check if request has valid admin token"""
+    if not adminToken:
+        return False
+    authHeader = request.headers.get("Authorization")
+    if not authHeader:
+        return False
+    if re.match(r"^Bearer ", authHeader):
+        return authHeader.split(" ", 1)[1] == adminToken
+    # HTTP Basic lets a browser reach admin pages through its native
+    # prompt: any user name, the admin token as password.
+    if re.match(r"^Basic ", authHeader):
+        try:
+            decoded = base64.b64decode(authHeader.split(" ", 1)[1]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        _, _, password = decoded.partition(":")
+        return password == adminToken
+    return False
+
+def authorizeRoom(request: Request):
+    """
+    Check if request has a valid room token.
+
+    Returns False when PROXY_ROOM_TOKEN is unset, which disables the route
+    altogether. The operational token is accepted as well, so a client that
+    already holds one does not need a second secret.
+    """
+    if not roomToken:
+        return False
     authHeader = request.headers.get("Authorization")
     if not authHeader or not re.match(r"^Bearer ", authHeader):
         return False
     token = authHeader.split(" ", 1)[1]
-    return token == adminToken
+    return token == roomToken or token == allowedToken
+
 
 def findAvailableGateway():
     for key in redisClient.scan_iter(match="gateway:*"):
         value = redisClient.get(key)
-        parts = value.split("|")
-        gwIp = parts[redis_gw_ip_index]
-        state = parts[redis_gw_state_index] if len(parts) > redis_gw_state_index else None
-        if state == "started":
+        gw = gwLoad(value)
+        gwIp = gw["gw_ip"]
+        state = gw.get("gw_state")
+        if state in ("created", "stopped"):
             return [key, gwIp]
     return None
 
-def updateProgressInfo(gw_id: str, parts: list, data: dict):
+def updateProgressInfo(gw_id: str, gw: dict, data: dict):
     recording = data.get("recording_duration")
     streaming = data.get("streaming_duration")
     transcript = data.get("transcript_progress")
     state  = data.get("gw_state")
-    parts += [""] * (redis_gw_field_count - len(parts))
+    room = data.get("room")
+    physicalRoom = data.get("physical_room")
+    browsing = data.get("browsing")
+    peerUri = data.get("peer_uri")
+    peerName = data.get("peer_name")
+    callStarted = data.get("call_started")
     if recording:
-        parts[redis_gw_media_duration_index] = f"{recording}"
+        gw["media_duration"] = f"{recording}"
     if streaming:
-        parts[redis_gw_media_duration_index] = f"{streaming}"
+        gw["media_duration"] = f"{streaming}"
     if transcript:
-        parts[redis_gw_transcript_progress_index] = f"{transcript}"
+        gw["transcript_progress"] = f"{transcript}"
     # Update Gateway State
     if (state == "up"):
-        parts[redis_gw_state_index] = "working"
+        gw["gw_state"] = "started"
     elif (state == "down"):
-        parts[redis_gw_state_index] = "started"
+        # The container has exited; the VM stays provisioned and reusable.
+        gw["gw_state"] = "stopped"
+    # null where the pipe-separated form had to write the word "None", having
+    # no way to tell an absent value from that text.
+    gw["room"] = f"{room}" if room else None
+    gw["physical_room"] = f"{physicalRoom}" if physicalRoom else None
+    gw["browsing"] = f"{browsing}" if browsing else None
+    gw["peer_uri"] = f"{peerUri}" if peerUri else None
+    gw["peer_name"] = f"{peerName}" if peerName else None
+    gw["call_started"] = f"{callStarted}" if callStarted else None
 
-    mapping = "|".join(parts)
+    mapping = gwDump(gw)
     redisClient.set(f"gateway:{gw_id}", mapping)
 
 def getGatewayStatusFromRedis(gw_id: str):
     rawValue = redisClient.get(f"gateway:{gw_id}")
     if not rawValue:
         return None
-    parts = rawValue.split("|")
-    gwIp = parts[redis_gw_ip_index]
-    room = parts[redis_gw_room_index] if len(parts) > redis_gw_room_index else None
-    state = parts[redis_gw_state_index] if len(parts) > redis_gw_state_index else None
-    media_duration = parts[redis_gw_media_duration_index] if len(parts) > redis_gw_media_duration_index else None
-    redis_gw_transcript_progress_index = 6
-    transcript = parts[redis_gw_transcript_progress_index] if len(parts) > redis_gw_transcript_progress_index else None
+    gw = gwLoad(rawValue)
+    gwIp = gw["gw_ip"]
+    room = gw.get("room")
+    physicalRoom = gw.get("physical_room")
+    state = gw.get("gw_state")
+    media_duration = gw.get("media_duration")
+    transcript = gw.get("transcript_progress")
+    browsing = gw.get("browsing")
+    gwType = gw.get("gw_type")
+    peerUri = gw.get("peer_uri")
+    peerName = gw.get("peer_name")
+    callStarted = gw.get("call_started")
     return {
         "status": "success",
         "data": {
             "gw_id": gw_id,
+            "gw_type": cleanPart(gwType),
             "gw_state": state,
-            "room": room,
+            "room": cleanPart(room),
+            "physical_room": cleanPart(physicalRoom),
+            "browsing": cleanPart(browsing),
+            "peer_uri": cleanPart(peerUri),
+            "peer_name": cleanPart(peerName),
+            "call_started": cleanPart(callStarted),
             "media_duration": media_duration,
             "transcript_progress": transcript
         }
     }
+
+def normalizeSipUri(uri: str) -> str:
+    """
+    Accept both "user@domain" and "sip:user@domain".
+
+    Endpoints report their own identity without the scheme, while the gateway
+    records it normalised. Mirrors normalizeSipUri() in src/logParse.py.
+    """
+    cleanUri = (uri or "").strip()
+    if not cleanUri:
+        return ""
+    if cleanUri.startswith("sip:"):
+        return cleanUri
+    if "@" in cleanUri:
+        return "sip:" + cleanUri
+    return cleanUri
+
+@app.get("/gateway_id")
+async def gatewayIdFromPeerUri(request: Request, peer_uri: str = None):
+    """
+    GET /gateway_id?peer_uri=<sip uri> - Resolve the gateway currently serving
+    a given SIP endpoint.
+
+    Endpoints know their own registration URI but not the identifier of the
+    gateway they are calling. This lets a room-side SIP client obtain it in order to issue
+    control commands for the duration of the call.
+
+    Only gateways with an established call carry a peer_uri, so an endpoint
+    that is not in a call cannot be resolved.
+    """
+    if not authorizeRoom(request):
+        return Response(
+            json.dumps({"error": "authorization error"}),
+            status_code=401,
+            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+            media_type="application/json"
+        )
+
+    if not peer_uri:
+        raise HTTPException(status_code=400, detail="Missing 'peer_uri' parameter")
+
+    wanted = normalizeSipUri(peer_uri).lower()
+
+    # A gateway torn down after a hangup may still hold a mapping until the
+    # next monitor cycle, so the most recently established call wins.
+    best = None
+    for key in redisClient.scan_iter(match="gateway:*"):
+        rawValue = redisClient.get(key)
+        if not rawValue:
+            continue
+        gw = gwLoad(rawValue)
+
+        peerUri = cleanPart(gw.get("peer_uri"))
+        if not peerUri or normalizeSipUri(peerUri).lower() != wanted:
+            continue
+
+        callStarted = cleanPart(gw.get("call_started")) or ""
+        if best is None or callStarted > best["call_started"]:
+            best = {
+                "gw_id": key.split(":")[-1],
+                "room": cleanPart(gw.get("room")),
+                "browsing": cleanPart(gw.get("browsing")),
+                "call_started": callStarted,
+            }
+
+    if not best:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No gateway currently serving '{peer_uri}'"
+        )
+
+    return {
+        "gw_id": best["gw_id"],
+        "room": best["room"],
+        "browsing": best["browsing"],
+    }
+
+# gw_state means operationally. The stored value says whether a container
+# runs; it does not say whether anyone is in a call, which is what a console
+# shows.
+#
+#   free   nothing running, or a container waiting to be used
+#   idle   in a call with the gateway, but no conference joined yet
+#   ivr    on the voice menu: a SIP peer, no room
+#   call   in a conference
+#   gone   the VM is on its way out
+#   other  a value this proxy does not know — surfaced, not guessed at
+def deriveState(gw: dict):
+    state = cleanPart(gw.get("gw_state"))
+    if state in ("created", "stopped"):
+        return "free"
+    if state == "deleted":
+        return "gone"
+    if state != "started":
+        return "other"
+    if cleanPart(gw.get("room")):
+        return "call"
+    if cleanPart(gw.get("call_started")) or cleanPart(gw.get("peer_uri")):
+        return "ivr"
+    return "idle"
+
 
 @app.get("/admin/statuses")
 async def adminStatus(request: Request):
@@ -134,69 +472,116 @@ async def adminStatus(request: Request):
         return Response(
             json.dumps({"error": "authorization error"}),
             status_code=401,
-            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+            headers={"WWW-Authenticate": 'Basic realm="SIPMediaGW admin", Bearer error="invalid_token"'},
             media_type="application/json"
         )
-    
+
+    # Redis stores pairing:<code> -> gw_id, while the console needs the
+    # reverse. Codes have a short TTL, so the value only holds at the
+    # time of the request.
+    pairingByGateway = {}
+    for pairingKey in redisClient.scan_iter(match="pairing:*"):
+        pairedGwId = redisClient.get(pairingKey)
+        if pairedGwId:
+            pairingByGateway[pairedGwId] = pairingKey.split(":", 1)[1]
+
     result = {}
     for key in redisClient.scan_iter(match="gateway:*"):
         gw_id = key.split(":")[-1]
         raw = redisClient.get(key)
         if not raw:
             continue
-        parts = raw.split("|")
-        gwIp = parts[redis_gw_ip_index]
-        room = parts[redis_gw_room_index] if len(parts) > redis_gw_room_index else None
-        state = parts[redis_gw_state_index] if len(parts) > redis_gw_state_index else None
-        media_duration = parts[redis_gw_media_duration_index] if len(parts) > redis_gw_media_duration_index else None
-        transcript = parts[redis_gw_transcript_progress_index] if len(parts) > redis_gw_transcript_progress_index else None
+        gw = gwLoad(raw)
+        # .get like everything below it: one malformed entry should not take
+        # the whole listing down with it.
+        gwIp = gw.get("gw_ip")
+        room = gw.get("room")
+        state = gw.get("gw_state")
+        media_duration = gw.get("media_duration")
+        transcript = gw.get("transcript_progress")
+        browsing = gw.get("browsing")
+        gwType = gw.get("gw_type")
+        peerUri = gw.get("peer_uri")
+        peerName = gw.get("peer_name")
+        callStarted = gw.get("call_started")
 
         result[gw_id] = {
             "gateway": gwIp,
+            "type": cleanPart(gwType),
             "status": state,
-            "room": room,
+            # What the stored value means, worked out once here rather than in
+            # each client.
+            "state": deriveState(gw),
+            "room": cleanPart(room),
             "media_duration": media_duration,
-            "transcript_progress": transcript
+            "transcript_progress": transcript,
+            "browsing": cleanPart(browsing),
+            "peer_uri": cleanPart(peerUri),
+            "peer_name": cleanPart(peerName),
+            "call_started": cleanPart(callStarted),
+            "pairing_code": pairingByGateway.get(gw_id)
         }
     return result
 
+async def _fetchAndStoreGatewayStatus(gw_id: str, gw_ip: str, gw: dict):
+    """
+    Fetch /gateway/status from a single gateway and update its Redis entry.
+    Used by the periodic monitor and the on‑demand monitor.
+    """
+    url = f"http://{gw_ip}/gateway/status"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = {"Authorization": f"Bearer {allowedToken}"}
+            response = await client.get(url, params={"gw_id": gw_id}, headers=headers)
+
+        data = response.json()
+        if data.get("status") == "success":
+            updateProgressInfo(gw_id, gw, data.get("data"))
+        else:
+            print(f"Gateway {gw_id} returned error → delete mapping")
+            redisClient.delete(f"gateway:{gw_id}")
+    except Exception as exc:
+        print(f"[fetchAndStoreGatewayStatus] error contacting {gw_ip}: {exc}")
+        redisClient.delete(f"gateway:{gw_id}")
+
+async def monitorOneGateway(gw_id: str, gw_ip: str):
+    """Check a single gateway (baresip/browser case) and refresh its Redis entry."""
+    raw = redisClient.get(f"gateway:{gw_id}")
+    gw = gwLoad(raw)
+    await _fetchAndStoreGatewayStatus(gw_id, gw_ip, gw)
+
 # Background task to monitor gateways
 async def monitorGateways(intervalSeconds: int = 30):
-    """Periodically check gateway states and update Redis mappings"""
+
+    # No failure ends the loop. An exception used to raise out of the task,
+    # which lifespan does not restart: the entries then stopped moving while
+    # /admin/statuses kept answering 200 with a frozen pool, and nothing said so.
+    # A bad entry is skipped on its own, so it cannot hide the entries scanned
+    # after it; a failure of Redis itself skips the rest of the cycle.
     while True:
         print("Checking gateway states...")
-        for key in redisClient.scan_iter(match="gateway:*"):
-            gw_id = key.split(":")[-1]
-            value = redisClient.get(key)
-            if not value:
-                continue
+        try:
+            for key in redisClient.scan_iter(match="gateway:*"):
+                gw_id = key.split(":")[-1]
+                try:
+                    value = redisClient.get(key)
+                    if not value:
+                        continue
 
-            parts = value.split("|")
-            gwIp = parts[redis_gw_ip_index]
+                    gw = gwLoad(value)
+                    gw_ip = gw.get("gw_ip")
+                    if not gw_ip:
+                        print(f"[monitorGateways] {key}: unreadable entry, skipped")
+                        continue
 
-            url = f"http://{gwIp}/gateway/status"
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    headers = {"Authorization": f"Bearer {allowedToken}"}
-                    response = await client.get(url, params={"gw_id": gw_id}, headers=headers)
-
-                    data = response.json()
-                    if data.get("status") == "success":
-                        updateProgressInfo(gw_id, parts, data.get("data"))
-                    elif data.get("status") == "error":
-                        print(f"Gateway {gw_id} doesn't exist, removing mapping")
-                        redisClient.delete(key)
-                    
-            except Exception as e:
-                print(f"Error checking {gwIp}: {e}")                
-                print(f"Removing mapping for Gateway {gw_id} (Http GW API is down)")
-                redisClient.delete(key)
+                    await _fetchAndStoreGatewayStatus(gw_id, gw_ip, gw)
+                except Exception as exc:
+                    print(f"[monitorGateways] {key}: {exc!r}, skipped")
+        except Exception as exc:
+            print(f"[monitorGateways] cycle failed: {exc!r}")
 
         await asyncio.sleep(intervalSeconds)
 
-@app.on_event("startup")
-async def startupEvent():
-    asyncio.create_task(monitorGateways(intervalSeconds=30))
 
 @app.get("/assets/{file_name}")
 def get_asset(file_name: str):
@@ -210,6 +595,123 @@ def get_asset(file_name: str):
         media_type="application/x-xz",
         filename=file_name,
     )
+
+# Behind a reverse proxy every request carries the proxy's own address, which
+# would put every visitor on one counter and let the first heavy hand lock out
+# the rest. X-Forwarded-For says who asked, but anyone can send it: it is read
+# only where PROXY_TRUST_FORWARDED says a front end sets it.
+codeTryLimit = int(os.getenv("PROXY_CODE_TRY_LIMIT", "10"))
+codeTryWindow = int(os.getenv("PROXY_CODE_TRY_WINDOW", "60"))
+trustForwarded = os.getenv("PROXY_TRUST_FORWARDED", "").lower() in ("1", "true", "yes")
+
+
+def callerAddress(request: Request):
+    if trustForwarded:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def tooManyCodeTries(request: Request):
+    """True once a caller has spent its failed attempts for the window."""
+    if codeTryLimit <= 0:
+        return False
+    return int(redisClient.get(f"codetries:{callerAddress(request)}") or 0) >= codeTryLimit
+
+
+def noteFailedCodeTry(request: Request):
+    """Only failures count: someone reading a code off a room screen gets it
+    right, and it is the repeated miss that marks a search."""
+    if codeTryLimit <= 0:
+        return
+    key = f"codetries:{callerAddress(request)}"
+    if redisClient.incr(key) == 1:
+        redisClient.expire(key, codeTryWindow)
+
+
+@app.post("/pairing/resolve")
+async def pairingResolve(request: Request):
+    """Turn a pairing code into a gw_id, without navigating anywhere.
+
+    The pairing page submits its form to /interact and lets the answer come
+    back as a page: a refused code then lands under /interact?pairingCode=...
+    while showing the pairing form, and carries its error in a <script> the
+    proxy injects into the markup. Asking here first lets the page stay where
+    it is and say so itself.
+
+    /interact keeps accepting pairingCode as before.
+    """
+    if tooManyCodeTries(request):
+        return JSONResponse(
+            status_code=429,
+            content={"status": "error", "error": {"code": 429, "detail": "Too many attempts"}, "data": None},
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # /interact matches the code as typed; normalising here means a code keyed
+    # in lower case resolves like any other.
+    code = str(body.get("code") or "").strip().upper()
+
+    gwId = redisClient.get(f"pairing:{code}") if code else None
+    if not gwId:
+        noteFailedCodeTry(request)
+        # A malformed code and an unknown one get the same answer: the endpoint
+        # says whether a code is live, and nothing else.
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error": {"code": 404, "detail": "Unknown pairing code"}, "data": None},
+        )
+
+    return {"status": "success", "error": None, "data": {"gw_id": gwId}}
+
+
+@app.get("/interact")
+async def interact(request: Request):
+
+    gwId = request.query_params.get("gwId") or request.query_params.get("gw_id")
+    if not gwId:
+        pairingCode = request.query_params.get("pairingCode")
+        if pairingCode and tooManyCodeTries(request):
+            raise HTTPException(status_code=429, detail="Too many attempts")
+        if pairingCode:
+            # Look‑up the gw_id stored under the pairing code
+            resolvedGwId = redisClient.get(f"pairing:{pairingCode}")
+            if resolvedGwId:
+                # Redirect to the same endpoint with the resolved gw_id
+                redirectUrl = "{}?gwId={}".format(str(request.url).split('?')[0], resolvedGwId)
+                return RedirectResponse(url=redirectUrl, status_code=302)
+            else:
+                # The pairing page used to be returned here with the error
+                # injected into its markup, which left the address bar on
+                # /interact while showing the pairing form — and a reload
+                # retried the code that had just been turned down. The visitor
+                # is sent to the pairing page instead, which now checks a code
+                # through /pairing/resolve before going anywhere.
+                noteFailedCodeTry(request)
+                return RedirectResponse(url="/pairing", status_code=302)
+        else:
+            with open(os.path.join(assetDir, "pairing.html"), "r", encoding="utf-8") as f:
+                html_form = f.read()
+            return Response(content=html_form, media_type="text/html")
+
+    # A gateway gone since the link was made (a reload after the call, an old
+    # tab) has nothing to drive: back to the pairing page, for the next code.
+    if not redisClient.get(f"gateway:{gwId}"):
+        return RedirectResponse(url="/pairing", status_code=302)
+
+    # The page itself is the same for every gateway — same image, same file —
+    # so it is served from here rather than fetched from the one it drives.
+    # Its commands are relayed as before.
+    try:
+        with open(os.path.join(assetDir, "interact.html"), "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type="text/html")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="interact.html not found on server")
 
 async def proxyToGateway(gwUrl: str, request: Request, params: dict, body: dict,headers: dict):
     """Forward request to gateway and return response"""
@@ -234,12 +736,16 @@ async def startGateway(request: Request):
     """POST /start - Start gateway for a room"""
     if not authorize(request):
         return Response(
-            json.dumps({"error": "authorization error"}),
+            json.dumps({"error": "authorization error invalid_token "}),
             status_code=401,
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             media_type="application/json"
         )
-    
+
+    browsing = (await request.json()).get("browsing")
+    if not browsing:
+        raise HTTPException(status_code=400, detail="Missing 'browsing' parameter")
+
     room = (await request.json()).get("room")
     if not room:
         raise HTTPException(status_code=400, detail="Missing 'room' parameter")
@@ -251,14 +757,14 @@ async def startGateway(request: Request):
     gateway = findAvailableGateway()
     if not gateway:
         raise HTTPException(status_code=503, detail="No available gateways")
-    
+
     gw_id = gateway[0].split(":")[-1]
     gwIp = gateway[1]
-    
+
     print(f"Allocating gateway {gw_id} ({gwIp}) for room {room}")
-    
+
     params = dict(request.query_params)
-    
+
     gwUrl = f"http://{gwIp}/gateway/start"
     headers = {"Authorization": request.headers.get("Authorization", "")}
     body = await request.json()
@@ -266,23 +772,22 @@ async def startGateway(request: Request):
 
     gwResponse = await proxyToGateway(gwUrl, request, params, body, headers)
     responseJson = gwResponse.json()
-    
     try:
         status = responseJson.get("status")
         if status == "success":
             # Mark as working
             rawValue = redisClient.get(f"gateway:{gw_id}")
-            parts = rawValue.split("|") if rawValue else [gwIp]
-            parts += [""] * (redis_gw_field_count - len(parts))
-            parts[redis_gw_state_index] = "working"
-            parts[redis_gw_room_index] = room
-            mapping = "|".join(parts)
+            gw = gwLoad(rawValue) or {"gw_ip": gwIp}
+            gw["gw_state"] = "started"
+            gw["room"] = room if room else None
+            gw["browsing"] = browsing if browsing else None
+            mapping = gwDump(gw)
             redisClient.set(f"gateway:{gw_id}", mapping)
         else:
             raise HTTPException(status_code=503, detail=responseJson.get("error").get("detail"))
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=503, detail="Faild to parse Gateway Json response")
-    
+
     return Response(
         content=json.dumps(responseJson),
         status_code=gwResponse.status_code,
@@ -307,34 +812,42 @@ async def stopGateway(request: Request):
     rawValue = redisClient.get(f"gateway:{gw_id}")
     if not rawValue:
         raise HTTPException(status_code=404, detail=f"No mapping found for gateway '{gw_id}'")
-    
-    parts = rawValue.split("|")
-    gwIp = parts[redis_gw_ip_index]
+
+    gw = gwLoad(rawValue)
+    gwIp = gw["gw_ip"]
     body = await request.json()
 
     params = dict(request.query_params)
     gwUrl = f"http://{gwIp}/gateway/stop"
     headers = {"Authorization": request.headers.get("Authorization", "")}
-    
+
     gwResponse = await proxyToGateway(gwUrl, request, params, body, headers)
     responseJson = gwResponse.json()
     print("Gateway Stop Response:", responseJson)
-    
+
     try:
         detailsRes = responseJson.get("data", {}).get("processing_state", "")
         if "stopping" in detailsRes or "stopped" in detailsRes:
             # Mark as stopped
-            parts[redis_gw_room_index] = "None"
-            parts[redis_gw_state_index] = "stopped"
-            mapping = "|".join(parts)
+            gw["room"] = ''
+            gw["browsing"] = ''
+            gw["peer_uri"] = ''
+            gw["peer_name"] = ''
+            gw["call_started"] = ''
+            gw["gw_state"] = "deleted"
+            mapping = gwDump(gw)
             redisClient.set(f"gateway:{gw_id}", mapping)
             responseJson["status"] = "success"
         else:
             responseJson["status"] = "error"
     except Exception as e:
         print("Failed to parse JSON response:", e)
-        responseJson["status"] = "error"
-    
+        responseJson = {
+            "status": "error",
+            "error": "Failed to parse gateway response",
+            "data": gwResponse.json() if gwResponse.content else None
+        }
+
     return Response(
         content=json.dumps(responseJson),
         status_code=gwResponse.status_code,
@@ -345,15 +858,13 @@ async def stopGateway(request: Request):
 @app.get("/progress")
 async def statusGateway(request: Request, gw_id: str = None, room: str = None):
     """GET /status?gw_id=gatewayName - Get gateway status"""
-    if not authorize(request):
-        return Response(
-            json.dumps({"error": "authorization error"}),
-            status_code=401,
-            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-            media_type="application/json"
-        )
-
-
+    # if not authorize(request):
+    #     return Response(
+    #         json.dumps({"error": "authorization error"}),
+    #         status_code=401,
+    #         headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+    #         media_type="application/json"
+    #     )
 
     if not gw_id and not room:
         raise HTTPException(status_code=400, detail="Missing 'gw_id' or 'room' parameter")
@@ -365,8 +876,8 @@ async def statusGateway(request: Request, gw_id: str = None, room: str = None):
             rawValue = redisClient.get(key)
             if not rawValue:
                 continue
-            parts = rawValue.split("|")
-            gwRoom = parts[redis_gw_room_index] if len(parts) > redis_gw_room_index else None
+            gw = gwLoad(rawValue)
+            gwRoom = gw.get("room")
             if gwRoom == room:
                 gw_id = key.split(":")[-1]
                 break
@@ -376,11 +887,27 @@ async def statusGateway(request: Request, gw_id: str = None, room: str = None):
     rawValue = redisClient.get(f"gateway:{gw_id}")
     if not rawValue:
         raise HTTPException(status_code=404, detail=f"Gateway '{gw_id}' not found")
-    
-    parts = rawValue.split("|")
-    gwIp = parts[redis_gw_ip_index]
 
-    
+    gw = gwLoad(rawValue)
+    gwIp = gw["gw_ip"]
+
+    # ----- Refresh baresip and browser gateways on demand --------------------
+
+    gw_type = gw.get("gw_type")
+    if gw_type in ("baresip", "browser"):
+        # call the on‑demand monitor to get a fresh status
+        await monitorOneGateway(gw_id, gwIp)
+
+        # reload the (possibly updated) mapping
+        rawValue = redisClient.get(f"gateway:{gw_id}")
+        if not rawValue:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Gateway '{gw_id}' unreachable after on‑the‑fly check"
+            )
+        gw = gwLoad(rawValue)
+    # ------------------------------------------------------------------
+
     # Get Status from Redis
     responseJson = getGatewayStatusFromRedis(gw_id)
     if responseJson:
@@ -396,82 +923,137 @@ async def statusGateway(request: Request, gw_id: str = None, room: str = None):
             media_type="application/json"
         )
 
-@app.api_route("/command", methods=["GET", "POST"])
-async def commandGateway(request: Request):
-    """GET/POST /command - Send command to gateway"""
-    if not authorize(request):
-        return Response(
-            json.dumps({"error": "authorization error"}),
-            status_code=401,
-            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-            media_type="application/json"
-        )
-
-    body = await request.json()
-    gw_id = body.get("gw_id")
+async def genericGatewayProxy(request: Request, endpoint: str):
+    """Generic proxy for gateway endpoints like /command, /ivrConfig, /status, /icon/*"""
+    # Retrieve gw_id from query params (GET) or JSON body (POST)
+    gw_id = request.query_params.get("gw_id")
+    if request.method != "GET":
+        try:
+            body = await request.json()
+            gw_id = body.get("gw_id") or gw_id
+        except Exception:
+            pass
 
     if not gw_id:
         raise HTTPException(status_code=400, detail="Missing 'gw_id' parameter")
-    
-    rawValue = redisClient.get(f"gateway:{gw_id}")
-    if not rawValue:
-        raise HTTPException(status_code=404, detail=f"Gateway '{gw_id}' not found")
-    
-    parts = rawValue.split("|")
-    gwIp = parts[redis_gw_ip_index]
-    isStopped = len(parts) > redis_gw_state_index and parts[redis_gw_state_index] != "working"
 
-    if isStopped:
+    raw_value = redisClient.get(f"gateway:{gw_id}")
+    if not raw_value:
+        raise HTTPException(status_code=404, detail=f"Gateway '{gw_id}' not found")
+
+    gw = gwLoad(raw_value)
+    gw_ip = gw["gw_ip"]
+
+    isRunning = gw.get("gw_state") == "started"
+    if not isRunning:
+        print(f"Gateway '{gw_id}' is stopped, cannot send commands")
         raise HTTPException(status_code=403, detail=f"Gateway '{gw_id}' is stopped, cannot send commands")
-    body = await request.json()
 
     params = dict(request.query_params)
-    gwUrl = f"http://{gwIp}/command"
     headers = {"Authorization": request.headers.get("Authorization", "")}
-    
-    gwResponse = await proxyToGateway(gwUrl, request, params, body, headers)
-    responseJson = gwResponse.json()
-    
-    return Response(
-        content=json.dumps(responseJson),
-        status_code=gwResponse.status_code,
-        media_type="application/json"
-    )
+    body = await request.json() if request.method != "GET" else None
+    gw_url = f"http://{gw_ip}/gateway/{endpoint}"
+
+    gw_response = await proxyToGateway(gw_url, request, params, body, headers)
+
+    # Try to decode JSON; if it fails, return raw content (useful for binary icons)
+    try:
+        response_json = gw_response.json()
+        content = json.dumps(response_json)
+        media_type = "application/json"
+    except Exception:
+        content = gw_response.content
+        media_type = gw_response.headers.get("content-type", "application/octet-stream")
+
+    return Response(content=content, status_code=gw_response.status_code, media_type=media_type)
+
+@app.api_route("/command", methods=["POST"])
+async def commandGateway(request: Request):
+    return await genericGatewayProxy(request, "command")
+
+@app.api_route("/ivrConfig", methods=["GET"])
+async def ivrConfigGateway(request: Request):
+    return await genericGatewayProxy(request, "ivrConfig")
+
+@app.api_route("/browsing", methods=["GET"])
+async def ivrConfigGateway(request: Request):
+    return await genericGatewayProxy(request, "browsing")
+
+@app.api_route("/icon/{icon_name}", methods=["GET"])
+async def iconGateway(request: Request, icon_name: str):
+    return await genericGatewayProxy(request, f"icon/{icon_name}")
+
+@app.api_route("/logo/{logo_name}", methods=["GET"])
+async def logoGateway(request: Request, logo_name: str):
+    return await genericGatewayProxy(request, f"logo/{logo_name}")
 
 @app.post("/register")
 async def registerGateway(request: Request):
-    """POST /register - Register a new gateway"""
+    def generatePairingCode(length: int = 5) -> str:
+        return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
     if not authorize(request):
         return Response(
             json.dumps({"error": "authorization error"}),
             status_code=401,
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-            media_type="application/json"
+            media_type="application/json",
         )
-    
+
     try:
-        body = await request.json()
-        gwIp = body.get("gw_ip")
-        gw_id = body.get("gw_id")
+        body   = await request.json()
+        gwIp   = body.get("gw_ip")
+        gwId  = body.get("gw_id")
         gwType = body.get("gw_type", "media")
-        
-        if not gwIp or not gw_id:
+        pairingCode = body.get("pairing_code")
+        pairingTimeOut = body.get("pairing_timeout")
+        # If a pairing_code was provided, ensure we don't overwrite an existing mapping
+        if pairingCode:
+            if redisClient.exists(f"pairing:{pairingCode}"):
+                # pairing code already mapped, keep existing mapping and do not overwrite
+                existingGwId = redisClient.get(f"pairing:{pairingCode}")
+                # Use existing gwId for consistency (ignore the gw_id supplied if different)
+                gwId = existingGwId
+            else:
+                pairingCode = generatePairingCode()
+                redisClient.setex(f"pairing:{pairingCode}", pairingTimeOut, gwId)
+        else:
+            pairingCode = generatePairingCode()
+            redisClient.setex(f"pairing:{pairingCode}", pairingTimeOut, gwId)
+
+        if not gwIp or not gwId:
             raise HTTPException(status_code=400, detail="Missing 'gwIp' or 'gw_id'")
-        
-        # Register gateway in Redis
-        startTime = dt.datetime.now().isoformat()
-        gwValue = f"{gwIp}|started|{gwType}|None|{startTime}|0|0"
-        redisClient.set(f"gateway:{gw_id}", gwValue)
-        
-        print(f"Gateway registered: {gw_id} ({gwIp})")
-        
+
+        # A gateway re-registers every thirty seconds, and what it reports is
+        # only its address and kind: everything the monitor and the calls have
+        # written stays as it is. Keeping the entry and setting two fields says
+        # that; taking eleven fields apart to put them back did not.
+        gw = gwLoad(redisClient.get(f"gateway:{gwId}"))
+        if not gw:
+            gw = {
+                "gw_state": "created",
+                "start_time": dt.datetime.now().isoformat(),
+                "room": None,
+                "media_duration": "0",
+                "transcript_progress": "0",
+                "browsing": None,
+                "peer_uri": None,
+                "peer_name": None,
+                "call_started": None,
+            }
+        gw["gw_ip"] = gwIp
+        gw["gw_type"] = gwType
+        redisClient.set(f"gateway:{gwId}", gwDump(gw))
+        print(f"Gateway registered / updated: {gwId} ({gwIp})")
         return Response(
-            content=json.dumps({"status": "success", "gw_id": gw_id, "gw_ip": gwIp}),
+            content=json.dumps({"status": "success",
+                                "gw_id": gwId, "gw_ip": gwIp,
+                                "pairing_code": pairingCode}),
             status_code=200,
-            media_type="application/json"
+            media_type="application/json",
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.post("/unregister")
 async def unregisterGateway(request: Request):
@@ -483,23 +1065,21 @@ async def unregisterGateway(request: Request):
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             media_type="application/json"
         )
-    
     try:
         body = await request.json()
         gw_id = body.get("gw_id")
         
         if not gw_id:
             raise HTTPException(status_code=400, detail="Missing 'gw_id'")
-        
+
         # Check if gateway exists
         if not redisClient.exists(f"gateway:{gw_id}"):
             raise HTTPException(status_code=404, detail=f"Gateway '{gw_id}' not found")
-        
+
         # Remove gateway from Redis
         redisClient.delete(f"gateway:{gw_id}")
         
         print(f"Gateway unregistered: {gw_id}")
-        
         return Response(
             content=json.dumps({"status": "success", "gw_id": gw_id, "removed": True}),
             status_code=200,
@@ -509,6 +1089,33 @@ async def unregisterGateway(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+def serveDocsStatic(file_name: str):
+    """Serve doc assets that are explicitly allowed: .png and .css files."""
+    docs_root = Path(assetDir) / "docs"
+    requested = (docs_root / file_name).resolve()
+    try:
+        requested.relative_to(docs_root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    lower_name = requested.name.lower()
+    if requested.is_file() and requested.suffix.lower() == ".png":
+        return FileResponse(requested, media_type="image/png")
+    if requested.is_file() and requested.suffix.lower() == ".css":
+        return FileResponse(requested, media_type="text/css")
+
+    raise HTTPException(status_code=404, detail=f"File '{file_name}' not found")
+
+
+@app.get("/docs/{file_name:path}")
+async def docs_static(file_name: str):
+    return serveDocsStatic(file_name)
+
+
+@app.get("/docs")
+async def docs(lang: str = "fr"):
+    return FileResponse(DOCS.get(lang, DOCS["fr"]))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=9000)

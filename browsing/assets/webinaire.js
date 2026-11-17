@@ -42,7 +42,7 @@ class Webinaire extends UIHelper {
         if (this._participantsClosedOnEnter) return;
         try {
             // wait until the main UI is ready
-            const usersToggle = await this.waitForElement('[accesskey="U"]', { clickable: true }, 30000);
+            const usersToggle = await this.waitForElement('[accesskey="U"]', { clickable: true }, 15000);
             usersToggle.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
             this._participantsClosedOnEnter = true;
             console.log("[✓] Participants panel toggled (closed) on enter");
@@ -130,48 +130,101 @@ class Webinaire extends UIHelper {
 
     async browse() {
         try {
-            await this.closeParticipantsPanelOnEnter();
             await this.startAudio();
-            const acceptSelector = `[aria-label="Accept recording and continue"], [aria-label="Accepter l'enregistrement et poursuivre"]`;
-            const acceptEl = document.querySelector(acceptSelector);
+            const acceptSelector = "[data-test='recordingNotifyContinue'], [aria-label='Accept recording and continue']";
+            let acceptEl = document.querySelector(acceptSelector);
+            if (!acceptEl && document.querySelector("[data-test='recordingIndicator']")) {
+                // Recordable meeting: BBB may render the recording notice shortly after the audio modal closes
+                acceptEl = await this.waitForElement(acceptSelector, { visible: true }, 3000).catch(() => null);
+            }
             if (acceptEl) {
-                console.log('[INFO] Waiting for recording acceptance (human must click)...');
-                const timeoutMs = 80000; // 60s safety timeout so we never hang forever
-                const pollMs = 500;
-                const start = Date.now();
-                let lastLog = start;
-                while (Date.now() - start < timeoutMs) {
-                    const el = document.querySelector(acceptSelector);
-                    if (!el) {
-                        console.log('[✓] Accept button no longer in DOM, assuming accepted.');
-                        break;
+                console.log('[INFO] Waiting for recording acceptance (someone should trigger it)...');
+                // The IVR menu key listener is only installed once joined: handle key 6 here meanwhile
+                const acceptOnKey6 = (e) => {
+                    if (e.key === '6') {
+                        const btn = document.querySelector(acceptSelector);
+                        if (btn) {
+                            btn.click();
+                        }
                     }
-                    const style = window.getComputedStyle(el);
-                    const visible =
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        el.offsetHeight > 0 &&
-                        el.offsetWidth > 0;
-                    const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true';
-                    if (!visible || disabled) {
-                        console.log('[✓] Accept button no longer visible/enabled, assuming accepted.');
-                        break;
+                };
+                document.addEventListener('keydown', acceptOnKey6, true);
+                try {
+                    const timeoutMs = 120000; // safety timeout
+                    const pollMs = 500;
+                    const start = Date.now();
+                    while (Date.now() - start < timeoutMs) {
+                        const el = document.querySelector(acceptSelector);
+                        if (!el) break;
+                        const style = window.getComputedStyle(el);
+                        const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0 && el.offsetWidth > 0;
+                        if (!visible) break;
+                        await new Promise(res => setTimeout(res, pollMs));
                     }
-                    const now = Date.now();
-                    if (now - lastLog >= 5000) { // log every 5s for debugging
-                        console.log('[INFO] Still waiting for human recording acceptance...');
-                        lastLog = now;
-                    }
-                    await new Promise(res => setTimeout(res, pollMs));
+                } finally {
+                    document.removeEventListener('keydown', acceptOnKey6, true);
                 }
             }
             await this.startVideo();
             document.querySelector('[accesskey="M"]').click();
-                        
+            await this.closeParticipantsPanelOnEnter();
         } catch (error) {
             console.error('[✗] Join process failed:', error);
         } finally {
             this.joined = true;
+        }
+    }
+
+    async slideShot() {
+        try {
+            const selector = "#screenshareVideo";
+            // short wait for the element to appear if necessary
+            const wait = ms => new Promise(res => setTimeout(res, ms));
+            let video = document.querySelector(selector);
+            const maxWait = 2000;
+            const step = 100;
+            let waited = 0;
+            while (!video && waited < maxWait) {
+                await wait(step);
+                waited += step;
+                video = document.querySelector(selector);
+            }
+            if (!video) {
+                return null;
+            }
+            // await the video to have valid dimensions
+            if (!video.videoWidth || !video.videoHeight) {
+                await new Promise(resolve => {
+                    const onLoaded = () => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    };
+                    // fallback timeout if the event doesn't arrive
+                    const t = setTimeout(() => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    }, 1000);
+                    video.addEventListener('loadeddata', onLoaded);
+                });
+            }
+            const width = video.videoWidth || video.clientWidth || 640;
+            const height = video.videoHeight || video.clientHeight || Math.round(width * 9 / 16);
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+
+            ctx.drawImage(video, 0, 0, width, height);
+
+            const dataURL = canvas.toDataURL('image/png');
+            if (!dataURL) {
+                return null;
+            }
+            // return the base64 part (without "data:image/png;base64,")
+            return dataURL.split(',')[1];
+        } catch (e) {
+            console.error("slideShot failed:", e);
+            return null;
         }
     }
 
@@ -186,30 +239,89 @@ class Webinaire extends UIHelper {
                 document.querySelector("[data-test='leaveVideo']").click();
             }
         if (key == "3" || key == "c")
-            document.querySelector('[accesskey="P"]').click();
+            this.togglePublicChat();
         if (key == "4")
             document.querySelector('[accesskey="R"]').click();
         if (key == "5")
             document.querySelector('[accesskey="U"]').click();
-        if (key == "6")
-            document.querySelector(`[aria-label="Accept recording and continue"], [aria-label="Accepter l'enregistrement et poursuivre"]`)?.click();
+        if (key == "6") {
+            const acceptRecording = document.querySelector('[data-test="recordingNotifyContinue"], [aria-label="Accept recording and continue"]');
+            if (acceptRecording) {
+                acceptRecording.click();
+            }
             if (document.querySelector("[data-test='joinAudio']")) {
                 this.startAudio();
             }
+        }
         if (key == "s" || key == "q")
             document.querySelector("[data-test='startScreenShare']").click();
     }
 
-    async typeText(text) {
-        const input = document.querySelector('#message-input');
-        const lastValue = input.value;
-        input.value = text;
-        const tracker = input._valueTracker;
-        if (tracker) {
-            tracker.setValue(lastValue);
+    isPublicChatOpen() {
+        const hideBtn = document.querySelector('[data-test="hidePublicChat"]');
+        return !!(hideBtn && hideBtn.offsetParent !== null);
+    }
+
+    async togglePublicChat() {
+        // The public chat entry (accesskey P) lives in the user list, which is
+        // closed on enter: its element is not in the DOM while the list is closed.
+        try {
+            if (this.isPublicChatOpen()) {
+                document.querySelector('[data-test="hidePublicChat"]').click();
+                if (this._userListOpenedForChat) {
+                    const usersToggle = document.querySelector('[accesskey="U"]');
+                    if (usersToggle) usersToggle.click();
+                }
+                this._userListOpenedForChat = false;
+                console.log('[✓] Public chat hidden');
+                return;
+            }
+            const chatSelector = '[data-test="chatButton"][accesskey="P"]';
+            if (document.querySelector(chatSelector)) {
+                this._userListOpenedForChat = false;
+            } else {
+                const usersToggle = await this.waitForElement('[accesskey="U"]', { clickable: true }, 5000);
+                usersToggle.click();
+                this._userListOpenedForChat = true;
+            }
+            const chatBtn = await this.waitForElement(chatSelector, { clickable: true }, 5000);
+            chatBtn.click();
+            console.log('[✓] Public chat shown');
+        } catch (e) {
+            console.error('[✗] togglePublicChat failed:', e?.message || e);
         }
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        document.querySelector('[data-test="sendMessageButton"]').click();
+    }
+
+    async sendChat(message) {
+        if (!message || !String(message).trim()) {
+            console.error('[✗] Empty chat message');
+            return false;
+        }
+        // The message field is only mounted while the public chat is open: open it
+        // (as DTMF 3 does), send, then put the screen back as it was.
+        const openedHere = !this.isPublicChatOpen();
+        try {
+            if (openedHere) {
+                await this.togglePublicChat();
+            }
+            const input = await this.waitForElement('#message-input', { visible: true }, 5000);
+            // Native setter, so that React registers the new value
+            const proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, String(message));
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            const sendBtn = await this.waitForElement('[data-test="sendMessageButton"]', { clickable: true }, 5000);
+            sendBtn.click();
+            console.log('[✓] Chat message sent');
+            return true;
+        } catch (e) {
+            console.error('[✗] sendChat failed:', e?.message || e);
+            return false;
+        } finally {
+            if (openedHere && this.isPublicChatOpen()) {
+                await new Promise(r => setTimeout(r, 1500));
+                await this.togglePublicChat();
+            }
+        }
     }
     async leave() {
         console.log('[INFO] Leave the meeting room');

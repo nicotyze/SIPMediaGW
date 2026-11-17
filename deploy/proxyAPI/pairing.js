@@ -1,0 +1,360 @@
+// ---------------------------------------------------------------------------
+// Per-deployment settings. The service is white-labelled — VisioHub at RENATER,
+// Visiby Connect on NUBO — so the name, the logo and the documentation link are
+// gathered here rather than scattered through the markup.
+// ---------------------------------------------------------------------------
+const CODE_LENGTH = 5;
+
+const TEXTS = {
+  fr: {
+    title: 'Contrôler votre réunion',
+    subtitle: "Saisissez le code affiché à l'écran",
+    button: 'Valider',
+    hintTitle: 'Où trouver le code ?',
+    hint: "Ce code à 5 caractères s'affiche sur l'écran de la salle, à côté du QR code.",
+    warningTitle: 'Le code change régulièrement.',
+    warning: "Vérifiez-le à l'écran juste avant de valider.",
+    sample: 'Exemple',
+    sampleFrom: 'Depuis votre téléphone',
+    close: 'Fermer ce message',
+    errorPrefix: 'Le code',
+    errorSuffix: 'est erroné ou expiré, veuillez réessayer.',
+    tooMany: 'Trop de tentatives. Patientez une minute avant de réessayer.',
+    themeToLight: 'Passer en thème clair',
+    themeToDark: 'Passer en thème sombre',
+    boxLabel: (i) => `Caractère ${i + 1} sur ${CODE_LENGTH}`,
+  },
+  en: {
+    title: 'Control your meeting',
+    subtitle: 'Enter the code shown on screen',
+    button: 'Submit',
+    hintTitle: 'Where to find the code?',
+    hint: 'This 5-character code is shown on the room screen, next to the QR code.',
+    warningTitle: 'The code changes regularly.',
+    warning: 'Check it on the screen just before submitting.',
+    sample: 'Example',
+    sampleFrom: 'From your phone',
+    close: 'Dismiss this message',
+    errorPrefix: 'Code',
+    errorSuffix: 'is invalid or expired, please try again.',
+    tooMany: 'Too many attempts. Wait a minute before trying again.',
+    themeToLight: 'Switch to light theme',
+    themeToDark: 'Switch to dark theme',
+    boxLabel: (i) => `Character ${i + 1} of ${CODE_LENGTH}`,
+  },
+};
+
+// The code the proxy turned down, quoted back in the error message. The boxes
+// are cleared rather than kept: a refused code is not worth correcting one
+// character at a time, re-reading it from the room screen is the point.
+let rejectedCode = '';
+
+// Set when the proxy has had enough attempts from here for the moment.
+let waited = false;
+
+// When no language was chosen yet, fall back to the browser's, so a visitor
+// arriving straight here (from the room's QR code) starts in their language.
+let lang = localStorage.getItem('lang')
+  || ((navigator.language || '').toLowerCase().indexOf('en') === 0 ? 'en' : 'fr');
+if (!TEXTS[lang]) lang = 'fr';
+
+// The banner stays until it is closed rather than fading on a timer: it names
+// the code that was turned down, and the reader may need it while checking the
+// room screen.
+let dismissed = false;
+
+let dark = localStorage.getItem('theme')
+  ? localStorage.getItem('theme') === 'dark'
+  : window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+const $ = (id) => document.getElementById(id);
+
+// A tooltip is centred on its element, which puts it off the page when the
+// element sits near an edge - and where it sits depends on the text beside it.
+// The side is therefore chosen as the pointer arrives, not written into the
+// markup.
+document.addEventListener('mouseover', (e) => {
+  const el = e.target.closest('[data-tip]');
+  if (!el) return;
+  const box = el.getBoundingClientRect();
+  const half = 0.5 * Math.min(window.innerWidth, 320);   // a tooltip's worst case
+  delete el.dataset.tipAlign;
+  if (box.left + box.width / 2 < half) el.dataset.tipAlign = 'left';
+  else if (window.innerWidth - box.right + box.width / 2 < half) el.dataset.tipAlign = 'right';
+}, true);
+const boxes = [];
+
+// --- code entry ------------------------------------------------------------
+
+function buildBoxes() {
+  const wrap = $('code-boxes');
+  for (let i = 0; i < CODE_LENGTH; i++) {
+    const box = document.createElement('input');
+    box.type = 'text';
+    box.inputMode = 'text';
+    box.autocomplete = 'off';
+    box.autocapitalize = 'characters';
+    box.spellcheck = false;
+    box.maxLength = 1;
+    box.addEventListener('input', () => onInput(i));
+    box.addEventListener('keydown', (e) => onKeyDown(e, i));
+    box.addEventListener('paste', onPaste);
+    wrap.appendChild(box);
+    boxes.push(box);
+  }
+}
+
+function onInput(i) {
+  const box = boxes[i];
+  // The code is uppercase letters and digits; anything else is dropped rather
+  // than rejected, so a stray keystroke does not interrupt the entry.
+  box.value = box.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(-1);
+  if (box.value && i < CODE_LENGTH - 1) boxes[i + 1].focus();
+  refresh();
+}
+
+function onKeyDown(e, i) {
+  if (e.key === 'Backspace' && !boxes[i].value && i > 0) {
+    boxes[i - 1].focus();
+  } else if (e.key === 'ArrowLeft' && i > 0) {
+    e.preventDefault();
+    boxes[i - 1].focus();
+  } else if (e.key === 'ArrowRight' && i < CODE_LENGTH - 1) {
+    e.preventDefault();
+    boxes[i + 1].focus();
+  }
+}
+
+// A code copied from elsewhere arrives in one box: spread it across all of them.
+function onPaste(e) {
+  e.preventDefault();
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  setCode(text);
+}
+
+function setCode(value) {
+  const chars = String(value).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, CODE_LENGTH);
+  boxes.forEach((box, i) => { box.value = chars[i] || ''; });
+  refresh();
+  const next = chars.length < CODE_LENGTH ? chars.length : CODE_LENGTH - 1;
+  boxes[next].focus();
+}
+
+function code() {
+  return boxes.map((b) => b.value).join('');
+}
+
+function refresh() {
+  const complete = code().length === CODE_LENGTH;
+  boxes.forEach((b) => b.classList.toggle('filled', !!b.value));
+  $('btn').disabled = !complete;
+}
+
+// --- rendering -------------------------------------------------------------
+
+function render() {
+  const t = TEXTS[lang];
+
+  document.documentElement.lang = lang;
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+
+  $('lang-fr').setAttribute('aria-checked', String(lang === 'fr'));
+  $('lang-en').setAttribute('aria-checked', String(lang === 'en'));
+
+  const toggle = $('theme-toggle');
+  toggle.textContent = dark ? '☀' : '☾';
+  toggle.setAttribute('aria-pressed', String(dark));
+  toggle.setAttribute('aria-label', dark ? t.themeToLight : t.themeToDark);
+
+  $('title').textContent = t.title;
+  $('subtitle').textContent = t.subtitle;
+  $('btn-label').textContent = t.button;
+  $('hint-title').textContent = t.hintTitle;
+  $('hint-text').textContent = t.hint;
+  $('hint-warning-title').textContent = t.warningTitle;
+  $('hint-warning-text').textContent = t.warning;
+  $('sample-badge').textContent = t.sample;
+  $('sample-from').textContent = t.sampleFrom;
+
+  boxes.forEach((box, i) => box.setAttribute('aria-label', t.boxLabel(i)));
+
+  // The rejected code is named in the message: on a screen where five boxes
+  // now sit empty, "this code" alone would leave the reader wondering which.
+  const banner = $('error-banner');
+  banner.hidden = (!rejectedCode && !waited) || dismissed;
+  $('error-close').setAttribute('aria-label', t.close);
+
+  if (waited) {
+    $('error-text').textContent = t.tooMany;
+  } else if (rejectedCode) {
+    const text = $('error-text');
+    text.textContent = '';
+    text.append(t.errorPrefix + ' ');
+    const codeEl = document.createElement('b');
+    codeEl.textContent = rejectedCode;
+    text.append(codeEl, ' ' + t.errorSuffix);
+  }
+
+  // The address the room screen shows under the code. Taken from where the
+  // visitor already is, so the illustration matches their own deployment.
+  $('sample-url').textContent = window.location.host;
+
+  const link = $('doc-link');
+  const selectedDocUrl = BRAND.docUrl
+    ? (lang === 'fr' ? (BRAND.docUrlFr || BRAND.docUrl) : (BRAND.docUrlEn || BRAND.docUrl))
+    : '';
+  if (selectedDocUrl) {
+    link.href = selectedDocUrl;
+    link.textContent = lang === 'fr' ? BRAND.docLabelFr : BRAND.docLabelEn;
+    // Inside a wide portal the link would only reopen the page the visitor is
+    // already on, so it goes away there; on phones the click toggles the
+    // portal's presentation instead (see the click handler).
+    link.parentElement.hidden = portalContext() === 'wide';
+  } else {
+    link.parentElement.hidden = true;
+  }
+}
+
+function setLang(value) {
+  lang = value;
+  localStorage.setItem('lang', value);
+  render();
+}
+
+// --- startup ---------------------------------------------------------------
+
+buildBoxes();
+
+$('lang-fr').addEventListener('click', () => setLang('fr'));
+$('lang-en').addEventListener('click', () => setLang('en'));
+// A click in the gaps between boxes lands on the strip itself; send it to the
+// first box still waiting for a character.
+$('code-boxes').addEventListener('mousedown', (e) => {
+  if (e.target !== e.currentTarget) return;   // a box was clicked, leave it be
+  e.preventDefault();
+  const next = boxes.find((b) => !b.value) || boxes[CODE_LENGTH - 1];
+  next.focus();
+});
+
+$('error-close').addEventListener('click', () => {
+  dismissed = true;
+  $('error-banner').hidden = true;
+});
+
+$('theme-toggle').addEventListener('click', () => {
+  dark = !dark;
+  localStorage.setItem('theme', dark ? 'dark' : 'light');
+  render();
+});
+
+// The portal context, read from the page's own frame. "standalone" covers a
+// top-level visit (the room's QR code) and a cross-origin embed alike, where
+// the parent's location is not readable; the link keeps its ordinary new-tab
+// behavior in both. "narrow" and "wide" are the portal's phone and desktop.
+function portalContext() {
+  if (window.parent === window) return 'standalone';
+  try {
+    const p = window.parent;
+    const inPortal = p.location.origin === location.origin
+      && (p.location.pathname === '/portal' || p.location.pathname === '/');
+    if (!inPortal) return 'standalone';
+    return p.matchMedia('(min-width:62rem)').matches ? 'wide' : 'narrow';
+  } catch (err) { return 'standalone'; }
+}
+
+// "Présentation du service" points at the portal. Inside the portal's phone
+// (same origin), on phones the presentation is an in-page mode of that
+// portal: toggle its hash instead of navigating the iframe (a portal inside
+// the portal) or opening a tab.
+$('doc-link').addEventListener('click', (e) => {
+  if (portalContext() !== 'narrow') return;
+  e.preventDefault();
+  window.parent.location.hash = '#presentation';   // a history entry: back restores the interface
+});
+
+// On a wide portal the link only reopens the current page, so it hides there;
+// re-check when a resize crosses the breakpoint.
+const syncDocLink = () => {
+  if (BRAND.docUrl) $('doc-link').parentElement.hidden = portalContext() === 'wide';
+};
+window.addEventListener('resize', syncDocLink);
+
+// The code is checked before going anywhere: the page asks the proxy, and
+// only navigates once it knows the code is live. A refused one is answered
+// here, without a round trip that would leave the address bar on a page the
+// visitor is not looking at.
+async function submit() {
+  const value = code();
+  if (value.length !== CODE_LENGTH) return;
+
+  $('spinner').hidden = false;
+  $('btn').disabled = true;
+  rejectedCode = '';
+  waited = false;
+  dismissed = false;
+  render();
+
+  let gwId = null;
+  let throttled = false;
+  try {
+    const res = await fetch('/pairing/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: value }),
+    });
+    if (res.ok) gwId = (await res.json())?.data?.gw_id || null;
+    // The proxy counts failed attempts and stops answering for a while. Telling
+    // the visitor their code is wrong would be untrue and send them straight
+    // back to try again.
+    throttled = res.status === 429;
+  } catch (e) {
+    // Unreachable proxy reads the same as a refused code here: either way the
+    // visitor has nothing to do but try again.
+  }
+
+  if (gwId) {
+    // The spinner keeps running until the browser leaves the page.
+    window.location.href = '/interact?gwId=' + encodeURIComponent(gwId);
+    return;
+  }
+
+  rejectedCode = throttled ? '' : value;
+  waited = throttled;
+  $('spinner').hidden = true;
+  boxes.forEach((b) => { b.value = ''; });
+  refresh();
+  render();
+  boxes[0].focus();
+}
+
+$('btn').addEventListener('click', submit);
+
+// Coming back with the browser's Back button restores the page from its cache,
+// spinner still turning and boxes still filled, without re-running any of this.
+// pageshow fires on that restore too, which is where the entry is reset.
+window.addEventListener('pageshow', (e) => {
+  if (!e.persisted) return;
+  $('spinner').hidden = true;
+  rejectedCode = '';
+  waited = false;
+  dismissed = false;
+  boxes.forEach((b) => { b.value = ''; });
+  refresh();
+  render();
+  boxes[0].focus();
+});
+
+// Enter anywhere in the strip submits, as a form would have.
+$('code-boxes').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); submit(); }
+});
+
+// A code in the query comes from the room screen, either scanned or typed from
+// the address printed under the QR. It is filled in rather than left for the
+// visitor to copy; submitting stays theirs to do.
+const fromQuery = new URLSearchParams(window.location.search).get('pairingCode');
+if (fromQuery) setCode(fromQuery);
+
+render();
+refresh();
+if (!fromQuery) boxes[0].focus();

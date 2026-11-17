@@ -67,7 +67,7 @@ class Webinaire(Browsing):
     def join(self):
         super().join()
         try:
-            WebDriverWait(self.driver, 10).until(EC.url_contains("sessionToken"))
+            WebDriverWait(self.driver, 10).until(EC.url_contains("html5client"))
         except:
             print("Cannot enter meeting", flush=True)
             return
@@ -75,19 +75,7 @@ class Webinaire(Browsing):
         self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)), './assets/uihelper.js'))
         self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)), './assets/webinaire.js'))
         self.driver.execute_script(self.initScript)
-        self.driver.execute_script("""
-            if (window.meeting) {
-                window.meeting.joined = true;
-                window.meeting.browse();
-            }
-        """)
-
-    def chatHandler(self):
-        try:
-            message = self.chatMsg.get(True, 0.02)
-            self.driver.execute_script('bbb.typeText("{}")'.format(message))
-        except Exception as e:
-            pass
+        self.driver.execute_script("window.meeting.browse();")
 
     def unset(self):
         try:

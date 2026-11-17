@@ -3,20 +3,20 @@
 import sys
 import os
 import traceback
-import queue
 import base64
 import json
 import time
 import threading
 import subprocess
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import NoSuchWindowException, WebDriverException
+import rtcstatsTrace
 
 class Browsing:
     def __init__(self, width, height, config,
                  modName=None, room=None, name=None,
                  service=None, chromeOptions=None,
-                 inputs=None):
+                 inputs=None, readPairingCode=None):
         self.url = ''
         self.room = room if room else {}
         self.name = name if name else ''
@@ -26,22 +26,34 @@ class Browsing:
         self.modName =  modName
         self.initScript = ''
         self.screenShared = False
+        self.streamedSlide = False
         self.userInputs = inputs
+        self.readPairingCode = readPairingCode
         self.service = service
         self.chromeOptions = chromeOptions
         if os.environ.get('AUDIO_ONLY') == "true":
             self.chromeOptions.add_argument('--headless=new')
             self.chromeOptions.add_argument('--use-fake-ui-for-media-stream')
-        self.chatMsg = queue.Queue()
         self.driver = None
+        self.rtcstatsOn = False
+        self.initScript = "window.meeting = new window.Browsing('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')".format(
+                                                    self.room['config']['webrtc_domain'],
+                                                    self.room['roomName'],
+                                                    self.room['displayName'],
+                                                    self.room['config']['lang'],
+                                                    json.dumps(self.room['config']['ivr_prompts']),
+                                                    self.room['roomToken'],
+                                                    os.environ.get('AUDIO_ONLY'),
+                                                    True if os.getenv("DUAL_SCREEN_LAYOUT") == "true"
+                                                        and os.getenv("DUAL_SCREEN_BY_DEFAULT") == "true" else False)
 
     def loadJS(self, jsScript):
         cssPath = os.path.join(os.path.dirname(__file__),
                                "../browsing/assets/IVR/style.css")
         self.driver.execute_script(f"window.cssPath = 'file://{cssPath}';")
         with open(jsScript, "r", encoding="utf-8") as f:
-            js_code = f.read()
-        self.driver.execute_script(js_code)
+            jsScript = f.read()
+        self.driver.execute_script(jsScript)
 
     def loadImages(self, path, lang):
         with open(os.path.join(path, "icon.png"), "rb") as f:
@@ -76,15 +88,9 @@ class Browsing:
         self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)),
                                  '../browsing/assets/uihelper.js'))
         self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)),
+                                 '../browsing/assets/slidestreamer.js'))
+        self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)),
                                  '../browsing/assets/{}.js'.format(self.modName)))
-        self.initScript = "window.meeting = new window.Browsing('{}', '{}', '{}', '{}', '{}', '{}')".format(
-                                                    self.room['config']['webrtc_domain'],
-                                                    self.room['roomName'],
-                                                    self.room['displayName'],
-                                                    self.room['config']['lang'],
-                                                    json.dumps(self.room['config']['ivr_prompts']),
-                                                    self.room['roomToken'],
-                                                    os.environ.get('AUDIO_ONLY'))
         self.driver.execute_script(self.initScript)
         self.driver.execute_script("window.meeting.join();")
 
@@ -115,26 +121,130 @@ class Browsing:
         thread.start()
         return thread
 
+    def monitorLeftMeeting(self, checkInterval=60):
+        def checkLoop():
+            while True:
+                try:
+                    left = self.driver.execute_script(
+                        "return ('hasLeft' in window.meeting) ? window.meeting.hasLeft() : null")
+                except Exception:
+                    return
+                if left is None:
+                    return
+                if left:
+                    print("Gateway is no longer in the conference, hanging up.", flush=True)
+                    subprocess.run(['echo "/hangup" | netcat -q 1 127.0.0.1 5555'], shell=True)
+                    return
+                time.sleep(checkInterval)
+        thread = threading.Thread(target=checkLoop, daemon=True)
+        thread.start()
+        return thread
     def browse(self):
         pass
 
-    def chatHandler(self):
-        pass
+    def dualScreenLayout(self):
+        self.slideSelector = self.driver.execute_script("return window.meeting.slideSelector;")
+
+    def manageLayout(self):
+        if os.getenv("DUAL_SCREEN_LAYOUT") == "true":
+            #if self.dualScreenOn ==True and self.slideSelector == None:
+            slideRes = os.getenv("VID_SIZE_SLIDE", "1280x720")
+            js = """
+            if (window.meeting.dualScreenOn && !window.meeting.slideStreamer) {
+                console.log('[INFO] Setting up dual screen layout...');
+                try {
+                    meeting.slideStreamer = new SlideStreamer({
+                        selector: meeting.slideSelector
+                    });
+                    meeting.slideStreamer.start(arguments[0]);
+                } catch (error) {
+                    console.error('[✗] Dual screen layout setup failed:', error);
+                }
+            }
+            if (!window.meeting.dualScreenOn && window.meeting.slideStreamer) {
+                console.log('[INFO] Tearing down dual screen layout...');
+                try {
+                    meeting.slideStreamer.stop();
+                    meeting.slideStreamer = null;
+                } catch (error) {
+                    console.error('[✗] Dual screen layout teardown failed:', error);
+                }
+            }
+            """
+            self.driver.execute_script(js, slideRes)
+            self.dualScreenLayout()
+        else: # single screen layout by default (nothing to do)
+            return
+
+    def checkStreamedSlide(self):
+        if not self.driver:
+            return
+        try:
+            streamedSlide = self.driver.execute_script("if(meeting.slideStreamer){" \
+                                                                "return meeting.slideStreamer.currentVideo !== null;" \
+                                                            "}" \
+                                                            "else{" \
+                                                                "return false;" \
+                                                            "}")
+        except NoSuchWindowException:
+            print("Chromium window closed", flush=True)
+            self.driver = None
+            return
+        except WebDriverException as e:
+            print(f"Error checking streamed slide status: {e}", flush=True)
+            return
+
+        if streamedSlide == True and self.streamedSlide == False and self.screenShared == False:
+            slideRes = os.getenv("VID_SIZE_SLIDE", "1280x720")
+            slideSrcCommand  = 'echo "/slidesrc avformat,http://0.0.0.0:8080,{},5,1000000" | netcat -q 1 127.0.0.1 5555'.format(slideRes)
+            subprocess.run([slideSrcCommand], shell=True)
+            subprocess.run(['echo "/floorreq" | netcat -q 1 127.0.0.1 5555'], shell=True)
+            self.streamedSlide = True
+        elif (streamedSlide == False or self.screenShared == True) and self.streamedSlide == True:
+            subprocess.run(['echo "/floorrel" | netcat -q 1 127.0.0.1 5555'], shell=True)
+            subprocess.run(['echo "/slidesrc fakevideo,nil,2x2,1,1000" | netcat -q 1 127.0.0.1 5555'], shell=True)
+            self.streamedSlide = False
 
     def interact(self):
         try:
             inKey = self.userInputs.get(True, 0.02)
+            if inKey == 's':
+                self.screenShared = True
+            if inKey == 'q':
+                self.screenShared = False
         except Exception as e:
             return
-        self.driver.execute_script(f"document.dispatchEvent(new KeyboardEvent('keydown',{{'key':'{inKey}'}}));")
+        try:
+            self.driver.execute_script("""
+                const key = arguments[0];
+                try {
+                    if (window.menu) {
+                        window.menu.interact(key);
+                    } else if (window.meeting && typeof window.meeting.interact === 'function') {
+                        // Avant l'arrivée du menu (ex. validation de l'enregistrement)
+                        window.meeting.interact(key);
+                    }
+                } catch (e) {
+                    console.warn('[WARN] interact error, key:', key, e);
+                }
+            """, inKey)
+        except Exception as e:
+            print(f"interact error: {e}", flush=True)
 
     def unset(self):
         pass
 
     def run(self):
         try:
-            self.driver = webdriver.Chrome(service=self.service,
-                                           options=self.chromeOptions)
+            # Before Chrome starts: the trace must wrap WebRTC before the meeting scripts run.
+            self.rtcstatsOn = rtcstatsTrace.prepare(self.chromeOptions,
+                                                    os.getenv('GW_NAME', ''),
+                                                    self.room.get('roomName', ''),
+                                                    self.modName)
+            self.driver = webdriver.Remote(
+                command_executor="http://127.0.0.1:9515",
+                options=self.chromeOptions
+            )
             self.loadPage()
             self.join()
             while True:
@@ -142,10 +252,13 @@ class Browsing:
                 if joined:
                     break
                 self.interact()
+            self.monitorLeftMeeting()
             if os.getenv("ENDING_TIMEOUT"):
                 self.monitorSingleParticipant(int(os.getenv("ENDING_TIMEOUT")), checkInterval=60)
+
             self.loadImages(os.path.join(os.path.dirname(os.path.normpath(__file__)),'../browsing/assets/'),
                             self.config['lang'])
+
             menuScript = "menu=new Menu({}, {}); \
                           menu.img['icon'] = '{}'; \
                           menu.img['dtmf'] = '{}'; \
@@ -156,9 +269,13 @@ class Browsing:
                             self.iconB64, self.dtmfB64, json.dumps(self.menuIcons))
             self.loadJS(os.path.join(os.path.dirname(os.path.normpath(__file__)),'../browsing/assets/IVR/menu.js'))
             self.driver.execute_script(menuScript)
+            self.readPairingCode(self.driver)
+
             while self.room:
+                self.checkStreamedSlide()
+                self.manageLayout()
                 self.interact()
-                self.chatHandler()
+                self.readPairingCode(self.driver)
         except Exception as e:
             print("Error while browsing: {}".format(e), flush=True)
 
@@ -167,13 +284,17 @@ class Browsing:
             self.room={}
             self.name=''
             if self.driver:
-                if self.driver.execute_script("return window.meeting"):
-                    self.unset()
+                try:
+                    if self.driver.execute_script("return window.meeting"):
+                        self.unset()
+                except:
+                    pass
+                if self.rtcstatsOn:
+                    rtcstatsTrace.close(self.driver)
+                    self.rtcstatsOn = False
                 self.driver.close()
                 self.driver.quit()
                 self.driver = []
                 print("Browsing stopped", flush=True)
         except Exception as e:
             traceback.print_exc(file=sys.stdout)
-
-

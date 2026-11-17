@@ -1,0 +1,385 @@
+class BBBESR extends UIHelper {
+    constructor(domain, roomName, displayName, lang, prompts, token, audioOnly) {
+        super();
+        this.domain = domain;
+        this.roomName = roomName;
+        this.displayName = displayName;
+        this.lang = lang;
+        this.token = token;
+        this.joined = false;
+        this.passwordPrompt = JSON.parse(prompts)[lang]['password'];
+    }
+
+    async tryClickWhileVisible(selector, retries = 5, delay = 1000) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                let el;
+                try {
+                    el = await this.waitForElement(selector, { clickable: true }, delay);
+                } catch (e) {
+                    console.warn(`[!] waitForElement failed for ${selector}: ${e.message}`);
+                    continue;
+                }
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                console.log(`[~] Click ${i + 1}/${retries} on ${selector}`);
+
+                await new Promise(res => setTimeout(res, delay));
+
+                const stillVisible = document.querySelector(selector);
+                if (!stillVisible || stillVisible.offsetParent === null) {
+                    console.log(`[✓] ${selector} is no longer visible after click`);
+                    return true;
+                }
+            } catch (e) {
+                console.warn(`[!] Attempt ${i + 1} failed for ${selector}: ${e.message}`);
+            }
+        }
+        console.warn(`[✗] Failed to click ${selector} after ${retries} attempts`);
+        return false;
+    }
+
+    async closeParticipantsPanelOnEnter() {
+        if (this._participantsClosedOnEnter) return;
+        try {
+            // wait until the main UI is ready
+            const usersToggle = await this.waitForElement('[accesskey="U"]', { clickable: true }, 15000);
+            usersToggle.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+            this._participantsClosedOnEnter = true;
+            console.log("[✓] Participants panel toggled (closed) on enter");
+        } catch (e) {
+            console.warn("[!] Could not close participants panel on enter:", e?.message || e);
+        }
+    }
+
+    async preJoin() {
+        if (window.location.href.includes('classe-virtuelle.numerique-esr.fr')) {
+            try{
+                const classroomBtn = await this.waitForElement(
+                    'button.c__button--primary[aria-label="Click here to access classroom"], button.c__button--primary',
+                    { visible: true, clickable: true }
+                );
+                if (classroomBtn) {
+                    classroomBtn.click();
+                }
+                const preJoinRoomBtn = await this.waitForElement(
+                    'button.c__button--primary[aria-label="Click here to access classroom"], button.c__button--primary',
+                    { visible: true, clickable: true },
+                    1000
+                );
+                if (preJoinRoomBtn) {
+                    preJoinRoomBtn.click();
+                }
+            } catch (error) {
+                console.error('[✗] Prejoin process failed:', error);
+            }
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+
+    async join() {
+        try {
+            let consentCheck;
+            try {
+                consentCheck = await this.waitForElement(
+                    '#consentCheck, label.c__checkbox input[type="checkbox"], .c__checkbox__wrapper input[type="checkbox"]',
+                    { visible: true },
+                    1000
+                );
+            } catch (e) {
+                console.error('[✗] Consent check not found:', e);
+            }
+            if (consentCheck) {
+                consentCheck.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+            console.log('[INFO] Waiting for display name input...');
+            let nameInput;
+            try {
+                nameInput = await this.waitForElement(
+                                        '#joinFormName, input.c__input, #fullname',
+                                        { visible: true }
+                                    );
+            } catch (e) {
+                console.error('[✗] Name field not found:', e);
+                return;
+            }
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(nameInput, this.displayName);
+            nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+            console.log('[✓] Name field detected and filled');
+            console.log('[INFO] Submitting join form...');
+            let joinButton;
+            try {
+                joinButton = await this.waitForElement(
+                                            "button[type='submit'], button.c__button--primary",
+                                            { clickable: true }
+                                        );
+            } catch (e) {
+                console.error('[✗] Join button not found:', e);
+                return;
+            }
+            joinButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            this.blockerFocus();
+            this.joined = true;
+            console.log('[✓] Join form submitted');
+        } catch (error) {
+            console.error('[✗] Join process failed:', error);
+        }
+    }
+
+    async startVideo() {
+        try {
+            console.log('[INFO] Activating camera...');
+            let cameraBtn;
+            try {
+                cameraBtn = await this.waitForElement("[data-test='joinVideo']", { clickable: true });
+            } catch (e) {
+                console.error('[✗] Camera button not found:', e);
+                return;
+            }
+            cameraBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            console.log('[✓] Camera button clicked');
+
+            console.log('[INFO] Setting video quality...');
+            const captureVideoQuality = "medium"; // or "low", "high"
+            let qualityDropdown;
+            try {
+                qualityDropdown = await this.waitForElement("#setQuality", { clickable: true });
+            } catch (e) {
+                console.error('[✗] Quality dropdown not found:', e);
+                return;
+            }
+            qualityDropdown.value = captureVideoQuality;
+            qualityDropdown.dispatchEvent(new Event("change", { bubbles: true }));
+            console.log(`[✓] Video quality set: ${captureVideoQuality}`);
+
+            console.log('[INFO] Starting webcam sharing...');
+            await this.tryClickWhileVisible('[data-test="startSharingWebcam"]');
+        } catch (error) {
+            console.error('[✗] startVideo failed:', error);
+        }
+    }
+
+    async startAudio() {
+        console.log('[INFO] Enabling microphone...');
+            let micDetails;
+            try {
+                micDetails = await this.waitForElement("[data-test='microphoneBtn']", { visible: true });
+            } catch (e) {
+                console.error('[✗] Microphone button not found:', e);
+                return;
+            }
+            micDetails.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            await this.tryClickWhileVisible('[data-test="joinEchoTestButton"]');
+    }
+
+    async browse() {
+        try {
+            await this.startAudio();
+            const acceptSelector = "[data-test='recordingNotifyContinue'], [aria-label='Accept recording and continue']";
+            let acceptEl = document.querySelector(acceptSelector);
+            if (!acceptEl && document.querySelector("[data-test='recordingIndicator']")) {
+                // Recordable meeting: BBB may render the recording notice shortly after the audio modal closes
+                acceptEl = await this.waitForElement(acceptSelector, { visible: true }, 3000).catch(() => null);
+            }
+            if (acceptEl) {
+                console.log('[INFO] Waiting for recording acceptance (someone should trigger it)...');
+                // The IVR menu key listener is only installed once joined: handle key 6 here meanwhile
+                const acceptOnKey6 = (e) => {
+                    if (e.key === '6') {
+                        const btn = document.querySelector(acceptSelector);
+                        if (btn) {
+                            btn.click();
+                        }
+                    }
+                };
+                document.addEventListener('keydown', acceptOnKey6, true);
+                try {
+                    const timeoutMs = 120000; // safety timeout
+                    const pollMs = 500;
+                    const start = Date.now();
+                    while (Date.now() - start < timeoutMs) {
+                        const el = document.querySelector(acceptSelector);
+                        if (!el) break;
+                        const style = window.getComputedStyle(el);
+                        const visible = style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0 && el.offsetWidth > 0;
+                        if (!visible) break;
+                        await new Promise(res => setTimeout(res, pollMs));
+                    }
+                } finally {
+                    document.removeEventListener('keydown', acceptOnKey6, true);
+                }
+            }
+            await this.startVideo();
+            document.querySelector('[accesskey="M"]').click();
+            await this.closeParticipantsPanelOnEnter();
+        } catch (error) {
+            console.error('[✗] Join process failed:', error);
+        } finally {
+            this.joined = true;
+        }
+    }
+    async slideShot() {
+        try {
+            const selector = "#screenshareVideo";
+            // short wait for the element to appear if necessary
+            const wait = ms => new Promise(res => setTimeout(res, ms));
+            let video = document.querySelector(selector);
+            const maxWait = 2000;
+            const step = 100;
+            let waited = 0;
+            while (!video && waited < maxWait) {
+                await wait(step);
+                waited += step;
+                video = document.querySelector(selector);
+            }
+            if (!video) {
+                return null;
+            }
+            // await the video to have valid dimensions
+            if (!video.videoWidth || !video.videoHeight) {
+                await new Promise(resolve => {
+                    const onLoaded = () => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    };
+                    // fallback timeout if the event doesn't arrive
+                    const t = setTimeout(() => {
+                        video.removeEventListener('loadeddata', onLoaded);
+                        resolve();
+                    }, 1000);
+                    video.addEventListener('loadeddata', onLoaded);
+                });
+            }
+            const width = video.videoWidth || video.clientWidth || 640;
+            const height = video.videoHeight || video.clientHeight || Math.round(width * 9 / 16);
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+
+            ctx.drawImage(video, 0, 0, width, height);
+
+            const dataURL = canvas.toDataURL('image/png');
+            if (!dataURL) {
+                return null;
+            }
+            // return the base64 part (without "data:image/png;base64,")
+            return dataURL.split(',')[1];
+        } catch (e) {
+            console.error("slideShot failed:", e);
+            return null;
+        }
+    }
+    interact(key) {
+        if (key == "1")
+            document.querySelector('[accesskey="M"]').click();
+        if (key == "2")
+            if (document.querySelector("[data-test='joinVideo']")) {
+                this.startVideo();
+            }
+            else if (document.querySelector("[data-test='leaveVideo']")) {
+                document.querySelector("[data-test='leaveVideo']").click();
+            }
+        if (key == "3" || key == "c")
+            this.togglePublicChat();
+        if (key == "4")
+            document.querySelector('[accesskey="R"]').click();
+        if (key == "5")
+            document.querySelector('[accesskey="U"]').click();
+        if (key == "6") {
+            const acceptRecording = document.querySelector('[data-test="recordingNotifyContinue"], [aria-label="Accept recording and continue"]');
+            if (acceptRecording) {
+                acceptRecording.click();
+            }
+            if (document.querySelector("[data-test='joinAudio']")) {
+                this.startAudio();
+            }
+        }
+        if (key == "s" || key == "q")
+            document.querySelector("[data-test='startScreenShare']").click();
+    }
+
+    isPublicChatOpen() {
+        const hideBtn = document.querySelector('[data-test="hidePublicChat"]');
+        return !!(hideBtn && hideBtn.offsetParent !== null);
+    }
+
+    async togglePublicChat() {
+        // The public chat entry (accesskey P) lives in the user list, which is
+        // closed on enter: its element is not in the DOM while the list is closed.
+        try {
+            if (this.isPublicChatOpen()) {
+                document.querySelector('[data-test="hidePublicChat"]').click();
+                if (this._userListOpenedForChat) {
+                    const usersToggle = document.querySelector('[accesskey="U"]');
+                    if (usersToggle) usersToggle.click();
+                }
+                this._userListOpenedForChat = false;
+                console.log('[✓] Public chat hidden');
+                return;
+            }
+            const chatSelector = '[data-test="chatButton"][accesskey="P"]';
+            if (document.querySelector(chatSelector)) {
+                this._userListOpenedForChat = false;
+            } else {
+                const usersToggle = await this.waitForElement('[accesskey="U"]', { clickable: true }, 5000);
+                usersToggle.click();
+                this._userListOpenedForChat = true;
+            }
+            const chatBtn = await this.waitForElement(chatSelector, { clickable: true }, 5000);
+            chatBtn.click();
+            console.log('[✓] Public chat shown');
+        } catch (e) {
+            console.error('[✗] togglePublicChat failed:', e?.message || e);
+        }
+    }
+
+    async sendChat(message) {
+        if (!message || !String(message).trim()) {
+            console.error('[✗] Empty chat message');
+            return false;
+        }
+        // The message field is only mounted while the public chat is open: open it
+        // (as DTMF 3 does), send, then put the screen back as it was.
+        const openedHere = !this.isPublicChatOpen();
+        try {
+            if (openedHere) {
+                await this.togglePublicChat();
+            }
+            const input = await this.waitForElement('#message-input', { visible: true }, 5000);
+            // Native setter, so that React registers the new value
+            const proto = input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, String(message));
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            const sendBtn = await this.waitForElement('[data-test="sendMessageButton"]', { clickable: true }, 5000);
+            sendBtn.click();
+            console.log('[✓] Chat message sent');
+            return true;
+        } catch (e) {
+            console.error('[✗] sendChat failed:', e?.message || e);
+            return false;
+        } finally {
+            if (openedHere && this.isPublicChatOpen()) {
+                await new Promise(r => setTimeout(r, 1500));
+                await this.togglePublicChat();
+            }
+        }
+    }
+    async leave() {
+        console.log('[INFO] Leave the meeting room');
+        try {
+            var leaveBtn = await this.waitForElement('[data-test="leaveMeetingDropdown"]', { clickable: true }, 10000);
+            leaveBtn.click();
+            var logOutBtn = await this.waitForElement('[data-test="directLogoutButton"]', { clickable: true }, 10000);
+            logOutBtn.click();
+        } catch (e) {
+            console.error('[✗] Logout failed:', e);
+        }
+    }
+}
+
+window.BBBESR = BBBESR;
+window.Browsing = BBBESR;

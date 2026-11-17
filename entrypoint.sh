@@ -6,11 +6,26 @@ if [[ -z "$GW_ID" ]]; then
 fi
 
 proxyRegister() {
+    PAIRING_TIMEOUT=$((PAIRING_CODE_TIMEOUT/GW_PROXY_REG_TIMEOUT))
+    PAIRING_TIMEOUT=$((GW_PROXY_REG_TIMEOUT*PAIRING_TIMEOUT-4))
     resp=$(curl -s -X POST "$GW_PROXY/register" \
-        -H "Authorization: Bearer $GW_TOKEN" \
+        -H "Authorization: Bearer $PROXY_TOKEN" \
         -H "Content-Type: application/json" \
-        -d '{"gw_id": "'$GW_NAME'", "gw_ip": "'$HOST_IP:$GW_API_PORT'", "gw_type": "'$MAIN_APP'"}' | logParse -p "ProxyRegister")
+        -d "$(printf '{"gw_id":"%s","gw_ip":"%s","gw_type":"%s", "pairing_code":"%s", "pairing_timeout":"%d"}' \
+                "$GW_NAME" "$HOST_IP:$GW_API_PORT" "$MAIN_APP" "$PAIRING_CODE" "$PAIRING_TIMEOUT")")
     echo "Registration response: $resp" | logParse -p "ProxyRegister"
+
+    pairing_code=$(echo "$resp" | jq -r '.pairing_code // empty')
+    if [[ -n "$pairing_code" ]]; then
+        # Update /etc/environment with PAIRING_CODE
+        if grep -q '^PAIRING_CODE=' /etc/environment; then
+            sudo sed -i "s/^PAIRING_CODE=.*/PAIRING_CODE=\"$pairing_code\"/" /etc/environment
+        else
+            echo "PAIRING_CODE=\"$pairing_code\"" | sudo tee -a /etc/environment > /dev/null
+        fi
+        . /etc/environment
+        echo "Pairing code set: $PAIRING_CODE" | logParse -p "ProxyRegister"
+    fi
 }
 
 # If GW_PROXY is set => register the gateway in the Redis Proxy
@@ -20,12 +35,12 @@ if [[ -n "$GW_PROXY" &&  -n "$GW_NAME" ]]; then
     (
         while true; do
             proxyRegister
-            sleep 60
+            sleep $GW_PROXY_REG_TIMEOUT
         done
     ) &
 fi
 
-if [[ -z "$ROOM_NAME" && ( "$MAIN_APP" != "baresip" ) ]]; then
+if [[ -z "$ROOM_NAME" &&  "$MAIN_APP" != "baresip" && "$MAIN_APP" != "browser"  ]]; then
     echo "Must provide ROOM_NAME with $MAIN_APP"
     exit 1
 fi
@@ -90,9 +105,9 @@ checkEventSrv() {
 
 envsubst < /var/browsing/assets/config.template.json > /var/browsing/assets/config.json
 
-
-
 if [[ "$MAIN_APP" == "recording" && $(ls /var/recording/*.mp4 2>/dev/null) ]]; then
+
+    echo "Start recording post-processing" | logParse -p "Recording"
 
     firstRec=$(ls -rt /var/recording/*.mp4 | head -n 1)
     DATE_TIME=$(TZ=$TZ stat --format='%W' "$firstRec" | awk '{print strftime("%Y_%m_%d_%H%M", $1)}')
@@ -170,9 +185,6 @@ if [[ "$AUDIO_ONLY" != "true" ]]; then
     mkdir -p /tmp/.X11-unix
     sudo chmod 1777 /tmp/.X11-unix
     sudo chown root /tmp/.X11-unix/
-
-    DISPLAY_WEB=${DISPLAY:-":99"}
-    DISPLAY_APP=:100
 
     if [[ -z "$DISPLAY" ]]; then
         echo "Display ID, web browser " $DISPLAY_WEB | logParse -p "Xvfb"

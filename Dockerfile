@@ -1,25 +1,45 @@
-FROM debian:12-slim
+FROM debian:13-slim
 
+ARG BARESIP_BRANCH=v3.15.0_patchv5
+ARG BARESIP_VERSION=3.15.0
+ARG ALLOW_DEV_BUILD=
+ARG GW_VERSION=1.8.9
+RUN test "$GW_VERSION" != "dev" -o "$ALLOW_DEV_BUILD" = "1" || ( \
+        echo 'GW_VERSION is required for a release build.'; \
+        echo 'Use --build-arg GW_VERSION=$(git describe --tags --always --dirty),'; \
+        echo 'or --build-arg ALLOW_DEV_BUILD=1 for a local one.'; \
+        false )
+ENV BARESIP_BRANCH=${BARESIP_BRANCH} \
+    BARESIP_VERSION=${BARESIP_VERSION} \
+    GW_VERSION=${GW_VERSION}
+
+# Debian 13 (trixie): the 64-bit time_t transition renamed libspandsp2 to
+# libspandsp2t64, and Python is 3.13, so the venv package is python3-venv.
+# GCC 14 turns incompatible-pointer-types and implicit-function-declaration
+# into errors; the Renater baresip patches trip both (call.c, modules/x11),
+# so they are downgraded back to warnings until the sources are fixed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd wget unzip net-tools sudo psmisc procps sngrep jq \
     v4l2loopback-utils libsdl2-2.0-0 libgl1-mesa-dri \
-    curl \
+    curl ca-certificates \
     fluxbox xdotool unclutter wmctrl \
     gettext-base xz-utils \
     dbus-user-session \
-    pulseaudio socat alsa-utils libspandsp2 \
+    pulseaudio socat alsa-utils libspandsp2t64 \
     ffmpeg xvfb \
-    python3 python3-pip python3-setuptools python3.11-venv \
+    python3 python3-pip python3-setuptools python3-venv \
     libnss3 openssl \
     libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
     libvpx-dev libopus-dev \
     libv4l-dev libx11-dev libxext-dev libspandsp-dev libasound2-dev libsdl2-dev \
     libssl-dev \
     build-essential cmake git \
-    && git clone --branch v3.15.0_patch https://github.com/Renater/re.git && cd re \
+    && git clone --branch ${BARESIP_BRANCH} https://github.com/Renater/re.git && cd re \
     && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && cmake --install build && cd .. \
-    && git clone --branch v3.15.0_patchv2 https://github.com/Renater/baresip.git && cd baresip \
-    && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && cmake --install build && cd .. \
+    && git clone --branch ${BARESIP_BRANCH} https://github.com/Renater/baresip.git && cd baresip \
+    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration" \
+    && cmake --build build -j && cmake --install build && cd .. \
     && rm -r baresip re \
     && apt-get remove --purge -y \
     libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
@@ -27,27 +47,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvpx-dev libopus-dev \
     libssl-dev \
     build-essential cmake git \
-    && apt autoremove -y \
-    && apt autoclean -y
+    && apt-get autoremove -y \
+    && apt-get autoclean -y \
+    && ldconfig
 
-#v=$(curl 'https://packages.debian.org/bookworm/amd64/chromium/download' | grep -o "chromium_.*.deb" | head -1 | cut -d "_" -f 2)
+#v=$(curl 'https://packages.debian.org/trixie/amd64/chromium/download' | grep -o "chromium_.*.deb" | head -1 | cut -d "_" -f 2)
 #https://snapshot.debian.org/archive/debian/20240930T202925Z/pool/main/c/chromium/
-RUN v='147.0.7727.137-1~deb12u1' \
+# Debian keeps only the current Chromium in the security pool and rotates it
+# about every week, so a pinned version stops resolving without warning. The
+# build tries the pin, falls back to the newest available version, and records
+# what it installed: two images from the same commit may then differ, and
+# /etc/chromium.version says how. The pool also carries Debian 12 packages,
+# hence the ~deb13u filter: the base image here is debian:13-slim.
+ARG CHROMIUM_VERSION=153.0.8010.52-1~deb13u1
+RUN set -eu \
    && url='http://security.debian.org/debian-security/pool/updates/main/c/chromium/' \
-   && wget $url'chromium_'$v'_amd64.deb' \
-   && wget $url'chromium-common_'$v'_amd64.deb' \
-   && wget $url'chromium-sandbox_'$v'_amd64.deb' \
-   && wget $url'chromium-driver_'$v'_amd64.deb' \
-   && apt install -y './chromium-sandbox_'$v'_amd64.deb' \
-   && apt install -y './chromium-common_'$v'_amd64.deb' \
-   && apt install -y './chromium_'$v'_amd64.deb' \
-   && apt install -y './chromium-driver_'$v'_amd64.deb' \
-   && rm *.deb
+   && pkgs='chromium chromium-common chromium-sandbox chromium-driver' \
+   && complete() { for p in $pkgs; do wget -q --spider "$url${p}_$1_amd64.deb" || return 1; done; } \
+   && v="$CHROMIUM_VERSION" \
+   && if ! complete "$v"; then \
+        echo '=============================================================='; \
+        echo "WARNING: Chromium $v is incomplete or gone from the Debian security pool."; \
+        v=''; \
+        for c in $(wget -qO- $url \
+            | grep -o 'chromium_[0-9][^"]*~deb13u[0-9]*_amd64\.deb' \
+            | sed 's/chromium_//;s/_amd64\.deb//' | sort -uVr); do \
+          if complete "$c"; then v="$c"; break; fi; \
+        done; \
+        [ -n "$v" ] || { echo 'No complete Debian 13 build found in the pool.'; exit 1; }; \
+        echo "Falling back to $v. This build is NOT reproducible;"; \
+        echo 'see /etc/chromium.version in the resulting image.'; \
+        echo '=============================================================='; \
+      fi \
+   && for p in $pkgs; do wget -q "$url${p}_${v}_amd64.deb" || exit 1; done \
+   && apt-get install -y './chromium-sandbox_'$v'_amd64.deb' \
+                         './chromium-common_'$v'_amd64.deb' \
+                         './chromium_'$v'_amd64.deb' \
+                         './chromium-driver_'$v'_amd64.deb' \
+   && rm *.deb \
+   && rm -rf /var/lib/apt/lists/* \
+   && echo "$v" > /etc/chromium.version \
+   && echo "Chromium installed: $v"
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip3 install --no-cache-dir --upgrade pip
-RUN pip3 install --no-cache-dir selenium requests pynetstring psutil
+RUN pip3 install --no-cache-dir selenium requests \
+                                pynetstring psutil \
+                                qrcode pillow \
+                                aiohttp
 
 COPY entrypoint.sh /var/
 COPY pulseaudio/init.sh /var/pulseaudio_init.sh
@@ -61,6 +109,7 @@ COPY baresip /var/baresip
 COPY streaming /var/streaming
 COPY recording /var/recording
 COPY transcript /var/transcript
+# browsing/assets/rtcstats/rtcstats.bundle.js is pre-built: tools/build-rtcstats-bundle.sh
 COPY browsing /var/browsing
 COPY src /var/src
 

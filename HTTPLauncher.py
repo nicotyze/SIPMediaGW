@@ -1,25 +1,27 @@
-# Single-file FastAPI app with pluggable backend (DockerGateway / FakeGateway)
-# - introduces MediaBackend ABC
-# - selects backend via MODE env var (MODE=fake -> FakeGateway)
-# - uses FastAPI Depends for injection
-# - keeps endpoints and response models compatible with previous behavior
+# Single-file FastAPI app with DockerGateway backend
 
 from fastapi import FastAPI, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, FileResponse
 from fastapi.exceptions import RequestValidationError, HTTPException
-from pydantic import BaseModel, RootModel, field_validator
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import Optional, Dict, Any
-from abc import ABC, abstractmethod
 import os
-import datetime as dt
 import subprocess
 import json
 import argparse
 import uvicorn
 from functools import lru_cache
+import urllib.error
+import urllib.request
 
 app = FastAPI(title="SIP Media Gateway API", version="1.0.0")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------
 # Models
@@ -47,6 +49,8 @@ class StartRequest(BaseModel):
     audio_only: Optional[str] = None
     api_key: Optional[str] = None
     recipient_mail: Optional[str] = None
+    user_name: Optional[str] = None
+    physical_room: Optional[str] = None
 
 class StartResponse(BaseResponse):
     data: Optional[Dict[str, str]] = None
@@ -72,40 +76,10 @@ class CommandResponse(BaseResponse):
     data: Optional[Dict[str, Any]] = None
 
 # -----------------------
-# Backend abstraction
+# DockerGateway
 # -----------------------
-class MediaBackend(ABC):
-    """Abstract gateway backend interface used by the API routes."""
-
-    @abstractmethod
-    def start_gateway(self, req: StartRequest) -> Dict[str, Any]:
-        """Start a gateway instance. Returns a dict with processing_state and optional data."""
-        pass
-
-    @abstractmethod
-    def stop_gateway(self, req: StopRequest) -> Dict[str, Any]:
-        """Stop a gateway instance. Returns a dict with processing_state and optional data."""
-        pass
-
-    @abstractmethod
-    def get_status(self, gw_id: str) -> Dict[str, Any]:
-        """Return gateway status or raise ValueError if not found."""
-        pass
-
-    @abstractmethod
-    def send_command(self, gw_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Send an arbitrary command to the gateway; return result or raise ValueError."""
-        pass
-
-# -----------------------
-# DockerGateway (placeholder)
-# -----------------------
-class DockerGateway(MediaBackend):
-    """
-    Real implementation placeholder.
-    NOTE: This class should contain the real docker/docker-compose logic in production.
-    Here it returns deterministic placeholder responses so API routes stay decoupled.
-    """
+class DockerGateway:
+    """Docker gateway implementation for managing SIP Media Gateway containers."""
 
     def __init__(self):
         # In real impl: initialize docker client or CLI helpers
@@ -139,6 +113,72 @@ class DockerGateway(MediaBackend):
         status = DockerGateway.get_status_by_name(result, gw_id)
         return status
 
+    @staticmethod
+    def get_gw_info(gw_id: str):
+        """
+        Return the docker compose ps info (as JSON) for the given gateway/project name.
+        """
+        gwSubProc = ['docker', 'compose', '-p', gw_id, 'ps', '--format', 'json']
+        res = subprocess.Popen(gwSubProc, cwd='.', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = res.communicate()
+        decoded = out.decode('utf-8').strip()
+        try:
+            parsed = json.loads(decoded)
+            if isinstance(parsed, dict):
+                result = [parsed]
+            elif isinstance(parsed, list):
+                result = parsed
+            else:
+                raise ValueError("Unexpected format")
+        except json.JSONDecodeError:
+            result = [json.loads(line) for line in decoded.split('\n') if line.strip()]
+
+        return next((c for c in result if c.get("Name", "").startswith("gw")), None)
+
+    @staticmethod
+    def parseHistoryFile(filepath):
+        result = {}
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                # Try to parse value as JSON, fallback to string
+                try:
+                    parsed = json.loads(value)
+                except Exception:
+                    parsed = value
+                result.setdefault(key, []).append(parsed)
+        return result
+
+    @staticmethod
+    def parseDisplayName(raw: str) -> str:
+        """
+        Strip the routing prefix from the peer display name.
+
+        Endpoints encode the dialled service in the display name as
+        "<targetLen>-<target><name>", where <target> is the service prefix
+        ("0" for the IVR, "3.<room>" for the Visio service):
+
+            "1-0TOTO"                -> "TOTO"
+            "12-3.azertyuiopTOTO"    -> "TOTO"
+
+        Mirrors the decoding performed in src/event_handler.py on
+        CALL_ESTABLISHED. Returns the input unchanged when it carries no
+        routing prefix.
+        """
+        value = (raw or "").strip()
+        if not value:
+            return ""
+        try:
+            prefix, remainder = value.split("-", 1)
+            return remainder[int(prefix):].strip()
+        except (ValueError, IndexError):
+            return value
+
     def start_gateway(self, req: StartRequest) -> Dict[str, Any]:
         print(f"[START CONTAINER] for gateway room={req.room} main_app={req.main_app}")
         gwSubProc = ['./SIPMediaGW.sh']
@@ -167,6 +207,10 @@ class DockerGateway(MediaBackend):
             gwSubProc.extend(['-g', req.gw_id])
         if req.main_app:
             gwSubProc.extend(['-a', req.main_app])
+        if req.user_name:
+            gwSubProc.extend(['-n', req.user_name])
+        if req.physical_room:
+            gwSubProc.extend(['-P', req.physical_room])
 
         filePath = os.path.dirname(__file__)
         print(gwSubProc)
@@ -180,7 +224,9 @@ class DockerGateway(MediaBackend):
         if resJson.get("res") != "ok":
             raise ValueError("Failed to start gateway container")
         
-        return {"processing_state": "working", "gw_id": req.gw_id}
+        return {"processing_state": "working",
+                "gw_id": resJson.get("gw_uid") or req.gw_id,
+                "gw_slot": resJson.get("gw_id")}
 
     def stop_gateway(self, req: StopRequest) -> Dict[str, Any]:
         print(f"[STOP CONTAINER] for gateway id={req.gw_id}")
@@ -223,29 +269,17 @@ class DockerGateway(MediaBackend):
 
         status = DockerGateway.get_gateway_docker_status(gw_id)
 
-        if 'exited' in status:
-            return {"gw_state": "down", "detail": "exited"}
-        elif status is None:
+        
+        if status is None:
             raise ValueError("Gateway not found")
         
-        # Check docker compose ps for the gateway
-        gwSubProc = ['docker', 'compose', '-p', gw_id, 'ps', '--format', 'json']
-        res = subprocess.Popen(gwSubProc, cwd='.', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = res.communicate()
-        decoded = out.decode('utf-8').strip()
-        try:
-            parsed = json.loads(decoded)
-            if isinstance(parsed, dict):
-                result = [parsed]
-            elif isinstance(parsed, list):
-                result = parsed
-            else:
-                raise ValueError("Unexpected format")
-        except json.JSONDecodeError:
-            result = [json.loads(line) for line in decoded.split('\n') if line.strip()]
+        if 'exited' in status:
+            return {"gw_state": "down", "detail": "exited"}
+    
+        gwData = DockerGateway.get_gw_info(gw_id)
 
         resp = {}
-        if not result:
+        if not gwData:
             resp['gw_state'] = "down"
             return resp
         else:
@@ -253,7 +287,6 @@ class DockerGateway(MediaBackend):
         
         resp["gw_id"] = gw_id
 
-        gwData = next((c for c in result if c.get("Name", "").startswith("gw")), None)
         gwName = gwData['Name']
         # Recording progress
         gwSubProc = ['docker', 'exec', gwName,
@@ -284,82 +317,285 @@ class DockerGateway(MediaBackend):
                 if mp4List else "0%"
             )
             resp["transcript_progress"] = processedPercent
+
+        # Physical room name, passed at launch (SIPMediaGW.sh -P) for browser
+        # gateways: the room the gateway physically controls. Absent when unset.
+        gwSubProc = ['docker', 'exec', gwName, 'sh', '-c', 'echo $PHYSICAL_ROOM']
+        res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = res.communicate()
+        physicalRoom = out.decode().strip()
+        if physicalRoom:
+            resp["physical_room"] = physicalRoom
+
+        historyFile = './logs/{}_history'.format(gwData['Name'])
+        history = self.parseHistoryFile(historyFile)
+        resp["browsing"] = ""
+        resp["room"] = ""
+        resp["peer_uri"] = ""
+        resp["peer_name"] = ""
+        resp["call_started"] = ""
+        # A call_start entry means a SIP endpoint is connected, even when
+        # no conference has been joined yet (room/browsing are set later, once
+        # the IVR selection completes).
+        if 'call_start' in history:
+            call = history['call_start'][-1]
+            if isinstance(call, dict):
+                resp["peer_uri"] = call.get("sourceURI", "") or ""
+                resp["peer_name"] = self.parseDisplayName(
+                    call.get("peerDisplayName", "")
+                )
+                resp["call_started"] = call.get("timestamp", "") or ""
+        if 'gw_start' in history:
+            if 'room' in history:
+                resp["room"] = history['room'][-1]['value']
+            if 'browsing' in history:
+                    resp["browsing"] = history['browsing'][-1]['value']
         return resp
 
-    def send_command(self, gw_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        print(f"[COMMAND] id={gw_id} payload={payload}")
-        status = DockerGateway.get_gateway_docker_status(gw_id)
+    def getIvrConfig(self, gwId: str) -> Dict[str, Any]:
+        """
+        Return IVR config for the given gateway: menu and webrtc_domains.
+        """
+        # 1. Get gateway info
+        gwData = DockerGateway.get_gw_info(gwId)
+        if not gwData:
+            raise ValueError("Gateway not found")
+
+        # 2. Read config.json from container
+        gwName = gwData['Name']
+        gwSubProc = [
+            'docker', 'exec', gwName,
+            'cat', '/var/browsing/assets/config.json'
+        ]
+        res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = res.communicate()
+        if res.returncode != 0:
+            raise ValueError(f"Failed to read config.json: {err.decode()}")
+        try:
+            browsingConfig = json.loads(out.decode())
+        except Exception as e:
+            raise ValueError(f"Invalid config.json: {e}")
+
+        # 3. Return menu and webrtc_domains
+        menus = browsingConfig.get('menus', {})
+        webrtcDomains = browsingConfig.get('webrtc_domains', {})
+        roomNameInfo = browsingConfig.get('room_name_info', {})
+
+        return {
+            "status": "success",
+            "menus": menus,
+            "webrtc_domains": webrtcDomains,
+            "room_name_info": roomNameInfo
+        }
+
+    def getSeleniumSessionId(self, gwId):
+        seleniumSessionId = ''
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:951{}/sessions'.format(gwId), timeout=3) as resp:
+                data = json.load(resp)
+                sid = ''
+                if isinstance(data, dict):
+                    sid = data.get('sessionId', '') or ''
+                if not sid:
+                    val = data.get('value')
+                    if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                        sid = val[0].get('id') or val[0].get('sessionId') or ''
+            seleniumSessionId = (sid or '').strip().replace('"', '')
+            return seleniumSessionId
+        except Exception:
+            print("Selenium Session Id not found")
+
+    SCRIPT_TIMEOUT_S = 15
+
+    def executeInExistingChromeSession(self, gwId: str, script: str, *args):
+        """
+        Run a script in the browser session the gateway already drives, with
+        one W3C request to its chromedriver.
+        """
+        sessionId = self.getSeleniumSessionId(gwId)
+        if not sessionId:
+            raise RuntimeError("no browser session on this gateway")
+        request = urllib.request.Request(
+            'http://127.0.0.1:951{}/session/{}/execute/sync'.format(gwId, sessionId),
+            data=json.dumps({"script": script, "args": list(args)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.SCRIPT_TIMEOUT_S) as resp:
+                return json.load(resp).get("value")
+        except urllib.error.HTTPError as exc:
+            # A W3C error answers {"value": {"error": ..., "message": ...}}:
+            # a script that throws, or a session that no longer exists.
+            try:
+                value = json.load(exc).get("value") or {}
+                message = value.get("message") or value.get("error") or str(exc)
+            except (ValueError, AttributeError):
+                message = str(exc)
+            raise RuntimeError("browser script failed: {}".format(message.splitlines()[0])) from None
+
+    def sendCommand(self, gwUid: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        gwData = DockerGateway.get_gw_info(gwUid)
+        if gwData is None:
+            raise ValueError("Gateway not found")
+        gwName = gwData['Name']
+
+        gwSubProc = ['docker', 'exec', gwName, 'sh', '-c', 'printf "%s\\n%s" "$DISPLAY_WEB" "$GW_ID"']
+        res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = res.communicate()
+        lines = out.decode().splitlines()
+        DISPLAY_WEB = lines[0].strip() if len(lines) > 0 else ''
+        gwId = lines[1].strip() if len(lines) > 1 else ''
+        print(f"[COMMAND] id={gwName} payload={payload}")
+
+        if payload['command'] == 'sendKey':
+            k = payload['param1']
+            if k == '#' or k == 'Enter':
+                k = 'numbersign'
+            if k == '*' or k == 'Backspace':
+                k = 'asterisk'
+            if k == '-':
+                k = 'minus'
+            gwSubProc = ['docker', 'exec', gwName,
+                            'sh', '-c',
+                            ('DISPLAY={} xdotool key {}'.format(DISPLAY_WEB, k))]
+            res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = res.communicate()
+        elif payload['command'] == 'sendString':
+            s = payload['param1']
+            # Envoie chaque caractère avec xdotool
+            for c in s:
+                if c == '#':
+                    k = 'numbersign'
+                elif c == '*':
+                    k = 'asterisk'
+                elif c == '-':
+                    k = 'minus'
+                else:
+                    k = c
+                gwSubProc = ['docker', 'exec', gwName,
+                                'sh', '-c',
+                                ('DISPLAY={} xdotool key {}'.format(DISPLAY_WEB, k))]
+                res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = res.communicate()
+        elif payload['command'] == 'sendChat':
+            msg = payload['param1']
+            ok = self.executeInExistingChromeSession(
+                gwId,
+                "return (window.meeting && window.meeting.sendChat) ? "
+                "window.meeting.sendChat(arguments[0]) : false;",
+                msg
+            )
+            if not ok:
+                raise ValueError("sendChat failed or not supported by this connector")
+            return {"ack": True, "sendChat": True}
+        elif payload['command'] == 'endCall':
+            gwSubProc = ['docker', 'exec', gwName,
+                            'sh', '-c',
+                            ('echo "/hangup" | netcat -q 1 127.0.0.1 5555')]
+            res = subprocess.Popen(gwSubProc, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = res.communicate()
+        elif payload['command'] == 'slideShot':
+            slideImgB64 = self.executeInExistingChromeSession(
+                gwId,
+                "return window.meeting.slideShot();"
+            )
+            return {"ack": True, "slideImg": slideImgB64}
+        elif payload['command'] == 'reaction':
+            reactionName = payload.get('param1')
+            if not reactionName:
+                raise ValueError("reaction requires param1")
+            ok = self.executeInExistingChromeSession(
+                gwId,
+                "return (window.meeting && window.meeting.reaction) ? "
+                "window.meeting.reaction(arguments[0]) : false;",
+                reactionName
+            )
+            if not ok:
+                raise ValueError(
+                    "reaction '{}' not supported by this connector".format(reactionName))
+            return {"ack": True, "reaction": reactionName}
+        elif payload['command'] == 'mediaState':
+            mediaState = self.executeInExistingChromeSession(
+                gwId,
+                "return (window.meeting && window.meeting.mediaState) ? "
+                "window.meeting.mediaState() : null;"
+            )
+            return {"ack": True, "mediaState": mediaState}
+        elif payload['command'] == 'uiState':
+            uiState = self.executeInExistingChromeSession(
+                gwId,
+                "return (window.meeting && window.meeting.uiState) ? "
+                "window.meeting.uiState() : null;"
+            )
+            return {"ack": True, "uiState": uiState}
+        elif payload['command'] == 'panelState':
+            panelState = self.executeInExistingChromeSession(
+                gwId,
+                "return (window.meeting && window.meeting.panelState) ? "
+                "window.meeting.panelState() : null;"
+            )
+            return {"ack": True, "panelState": panelState}
+        elif payload['command'] == 'camera':
+            cameraState = payload.get('param1')
+            if cameraState not in ('on', 'off'):
+                raise ValueError("camera param1 must be 'on' or 'off'")
+            self.executeInExistingChromeSession(
+                gwId,
+                "return window.meeting.camera(arguments[0]);",
+                cameraState
+            )
+            return {"ack": True, "camera": cameraState}
+        elif payload['command'] == 'microphone':
+            microphoneState = payload.get('param1')
+            if microphoneState not in ('on', 'off'):
+                raise ValueError("microphone param1 must be 'on' or 'off'")
+            self.executeInExistingChromeSession(
+                gwId,
+                "return window.meeting.microphone(arguments[0]);",
+                microphoneState
+            )
+            return {"ack": True, "microphone": microphoneState}
+        elif payload['command'] == 'displayName':
+            # safe read of optional param1
+            default = payload.get('param1', None)
+            res = {"ack": True}
+            if isinstance(default, str) and default != '':
+                self.executeInExistingChromeSession(gwId, """
+                    const params = new URLSearchParams(window.location.search);
+                    params.set('displayName', arguments[0]);
+                    history.replaceState(
+                        {},
+                        '',
+                        `${location.pathname}?${params.toString()}`
+                    );
+                """, default)
+            else:
+                name = self.executeInExistingChromeSession(
+                    gwId,
+                    "let name=new URLSearchParams(window.location.search).get('displayName'); return name;"
+                )
+                res["displayName"] = name
+            return res
+        elif payload['command'] == 'roomName':
+            # safe read of optional param1
+            default = payload.get('param1', None)
+            res = {"ack": True}
+            self.executeInExistingChromeSession(gwId, """
+                window.inputRoomName = arguments[0];
+                document.dispatchEvent(new KeyboardEvent('keydown', {'key': '#'}));;""", default)
+            return res
+        #status = DockerGateway.get_gateway_docker_status(gw_id)
         if status is None:
             raise ValueError("Gateway not found")
         return {"ack": True, "received": payload}
 
 # -----------------------
-# FakeGateway (in-memory deterministic, for tests)
-# -----------------------
-class FakeGateway(MediaBackend):
-    """In-memory fake backend suitable for unit/integration tests. Deterministic behaviour."""
-
-    def __init__(self):
-        # Simple in-memory map: gw_id -> metadata
-        self._store: Dict[str, Dict[str, Any]] = {}
-
-    def start_gateway(self, req: StartRequest) -> Dict[str, Any]:
-        now = dt.datetime.utcnow().isoformat()
-        self._store[req.gw_id] = {
-            "gw_state": "up",
-            "processing_state": "working",
-            "gw_id": req.gw_id,
-            "room": req.room,
-            "start_time": now,
-            "recording_duration": "00:00:00",
-            "transcript_progress": "0%",
-        }
-        return {"processing_state": "working", "gw_id": req.gw_id}
-
-    def stop_gateway(self, req: StopRequest) -> Dict[str, Any]:
-        if req.gw_id not in self._store:
-            raise ValueError("Gateway not found")
-        entry = self._store[req.gw_id]
-        entry["gw_state"] = "down"
-        entry["processing_state"] = "stopped"
-        # deterministic final durations
-        entry["recording_duration"] = entry.get("recording_duration", "00:00:00")
-        entry["transcript_progress"] = entry.get("transcript_progress", "0%")
-        return {"processing_state": "stopped"}
-
-    def get_status(self, gw_id: str) -> Dict[str, Any]:
-        if gw_id not in self._store:
-            raise ValueError("Gateway not found")
-        entry = self._store[gw_id].copy()
-        # update deterministic recording duration based on start_time
-        if entry.get("start_time") and entry.get("processing_state") == "working":
-            start = dt.datetime.fromisoformat(entry["start_time"])
-            elapsed = dt.datetime.utcnow() - start
-            entry["recording_duration"] = str(elapsed).split(".")[0]
-        return entry
-
-    def send_command(self, gw_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if gw_id not in self._store:
-            raise ValueError("Gateway not found")
-        if self._store[gw_id].get("processing_state") == "stopped":
-            raise ValueError("Gateway is stopped")
-        # For tests, echo back command with deterministic ack
-        return {"ack": True, "received": payload}
-
-# -----------------------
-# Backend selector (single place)
+# Backend selector
 # -----------------------
 @lru_cache()
-def get_backend() -> MediaBackend:
-    """
-    Decide which backend to use based on environment variable MODE.
-    - MODE=fake => FakeGateway
-    - otherwise => DockerGateway
-    Cached so DI returns the same instance.
-    """
-    mode = os.getenv("MODE", "").lower()
-    if mode == "fake":
-        return FakeGateway()
+def get_backend() -> DockerGateway:
+    """Get or create the DockerGateway instance."""
     return DockerGateway()
 
 # -----------------------
@@ -394,17 +630,21 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # HTTP Routes (no direct docker calls; backend injected)
 # -----------------------
 @app.post("/gateway/start", response_model=StartResponse)
-def start_gateway(req: StartRequest, backend: MediaBackend = Depends(get_backend)):
+def start_gateway(req: StartRequest, backend: DockerGateway = Depends(get_backend)):
     try:
         res = backend.start_gateway(req)
-        return StartResponse(status="success", data={"processing_state": res.get("processing_state"), "gw_id": res.get("gw_id")})
+        data = {"processing_state": res.get("processing_state"),
+                "gw_id": res.get("gw_id")}
+        if res.get("gw_slot") is not None:
+            data["gw_slot"] = res["gw_slot"]
+        return StartResponse(status="success", data=data)
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start gateway: {e}")
 
 @app.post("/gateway/stop", response_model=StopResponse)
-def stop(req: StopRequest, backend: MediaBackend = Depends(get_backend)):
+def stop(req: StopRequest, backend: DockerGateway = Depends(get_backend)):
     try:
         res = backend.stop_gateway(req)
         return StopResponse(status="success", data={"processing_state": res.get("processing_state")})
@@ -414,7 +654,7 @@ def stop(req: StopRequest, backend: MediaBackend = Depends(get_backend)):
         raise HTTPException(status_code=500, detail=f"Failed to stop gateway: {e}")
 
 @app.get("/gateway/status", response_model=StatusResponse)
-def status(gw_id: str, backend: MediaBackend = Depends(get_backend)):
+def status(gw_id: str, backend: DockerGateway = Depends(get_backend)):
     try:
         data = backend.get_status(gw_id)
         return StatusResponse(status="success", data=data)
@@ -423,10 +663,23 @@ def status(gw_id: str, backend: MediaBackend = Depends(get_backend)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/gateway/command", response_model=CommandResponse)
-def command(req: CommandRequest, backend: MediaBackend = Depends(get_backend)):
+@app.get("/gateway/ivrConfig")
+def gateway_ivr_config(gw_id: str, backend: DockerGateway = Depends(get_backend)):
+    """
+    HTTP GET endpoint to return IVR config (menu + webrtc_domains) for the given gateway.
+    """
     try:
-        result = backend.send_command(req.gw_id, req.payload)
+        result = backend.getIvrConfig(gw_id)
+        return result
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/gateway/command", response_model=CommandResponse)
+def command(req: CommandRequest, backend: DockerGateway = Depends(get_backend)):
+    try:
+        result = backend.sendCommand(req.gw_id, req.payload)
         return CommandResponse(status="success", data=result)
     except ValueError as ve:
         # 403 for stopped gateway, 404 for not found (backend decides)
@@ -436,6 +689,33 @@ def command(req: CommandRequest, backend: MediaBackend = Depends(get_backend)):
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def fetchGatewayImage(gw_id: str, subdir: str, filename: str) -> Response:
+    gwData = DockerGateway.get_gw_info(gw_id)
+    if not gwData:
+        raise HTTPException(status_code=404, detail="Gateway not found")
+    gwName = gwData['Name']
+    for ext in ['svg', 'png']:
+        res = subprocess.Popen(
+            ['docker', 'exec', gwName, 'cat',
+             f'/var/browsing/assets/IVR/images/{subdir}/{filename}.{ext}'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        out, _ = res.communicate()
+        if res.returncode == 0:
+            media_type = 'image/svg+xml' if ext == 'svg' else f'image/{ext}'
+            return Response(content=out, media_type=media_type)
+    raise HTTPException(status_code=404, detail="Icon not found")
+
+
+@app.get("/gateway/icon/{icon_name}")
+def get_icon(icon_name: str, gw_id: str):
+    return fetchGatewayImage(gw_id, "menu-icons", icon_name)
+
+
+@app.get("/gateway/logo/{logo_name}")
+def get_logo(logo_name: str, gw_id: str):
+    return fetchGatewayImage(gw_id, "domain-icons", logo_name)
 
 # -----------------------
 # Entrypoint
